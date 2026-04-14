@@ -8,8 +8,8 @@ import (
 	"net"
 	"syscall"
 
-	"github.com/wld/go-tunnel/internal/backpressure"
-	"github.com/wld/go-tunnel/internal/pool"
+	"github.com/Talbot3/go-tunnel/internal/backpressure"
+	"github.com/Talbot3/go-tunnel/internal/pool"
 )
 
 // platformForwarder implements optimized forwarding for Windows.

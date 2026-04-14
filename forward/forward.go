@@ -7,8 +7,8 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/wld/go-tunnel/internal/backpressure"
-	"github.com/wld/go-tunnel/internal/pool"
+	"github.com/Talbot3/go-tunnel/internal/backpressure"
+	"github.com/Talbot3/go-tunnel/internal/pool"
 )
 
 // Forwarder defines the interface for data forwarding.
@@ -34,17 +34,18 @@ func IsClosedErr(err error) bool {
 	if err == io.EOF {
 		return true
 	}
-	// Check for "use of closed network connection"
-	if opErr, ok := err.(*net.OpError); ok {
-		return opErr.Err.Error() == "use of closed network connection"
-	}
 	// Check for common connection close errors
 	switch err {
 	case syscall.EPIPE, syscall.ECONNRESET, syscall.ECONNABORTED:
 		return true
 	}
-	// Check for net.OpError with specific errors
+	// Check for net.OpError
 	if opErr, ok := err.(*net.OpError); ok {
+		// Check for "use of closed network connection"
+		if opErr.Err.Error() == "use of closed network connection" {
+			return true
+		}
+		// Check for syscall errors wrapped in OpError
 		switch opErr.Err {
 		case syscall.EPIPE, syscall.ECONNRESET, syscall.ECONNABORTED:
 			return true
@@ -152,5 +153,6 @@ func OptimizeTCPConn(conn *net.TCPConn) error {
 	if err := conn.SetKeepAlive(true); err != nil {
 		return err
 	}
-	return conn.SetKeepAlivePeriod(30e9) // 30 seconds
+	// 30 seconds keep-alive period
+	return conn.SetKeepAlivePeriod(30e9)
 }

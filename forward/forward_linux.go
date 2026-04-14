@@ -12,8 +12,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/wld/go-tunnel/internal/backpressure"
-	"github.com/wld/go-tunnel/internal/pool"
+	"github.com/Talbot3/go-tunnel/internal/backpressure"
+	"github.com/Talbot3/go-tunnel/internal/pool"
 )
 
 // platformForwarder implements zero-copy forwarding on Linux using splice.
@@ -61,9 +61,18 @@ func getFd(conn net.Conn) (int, error) {
 	}
 
 	var fd int
+	var controlErr error
 	raw.Control(func(fdPtr uintptr) {
+		defer func() {
+			if r := recover(); r != nil {
+				controlErr = errors.New("control function panicked")
+			}
+		}()
 		fd = int(fdPtr)
 	})
+	if controlErr != nil {
+		return -1, controlErr
+	}
 	return fd, nil
 }
 

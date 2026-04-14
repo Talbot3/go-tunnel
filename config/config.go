@@ -6,8 +6,6 @@ import (
 	"sync"
 
 	"gopkg.in/yaml.v3"
-
-	"github.com/wld/go-tunnel/protocol"
 )
 
 // Config represents the main configuration.
@@ -132,19 +130,9 @@ func (m *Manager) Reload() error {
 	return nil
 }
 
-// ToProtocolConfigs converts to protocol configs.
-func (c *Config) ToProtocolConfigs() []protocol.Config {
-	configs := make([]protocol.Config, 0, len(c.Protocols))
-	for _, p := range c.Protocols {
-		configs = append(configs, protocol.Config{
-			Name:    p.Name,
-			Listen:  p.Listen,
-			Target:  p.Target,
-			Enabled: p.Enabled,
-			Options: p.Options,
-		})
-	}
-	return configs
+// GetProtocolConfigs returns protocol configurations.
+func (c *Config) GetProtocolConfigs() []ProtocolConfig {
+	return c.Protocols
 }
 
 // Default returns the default configuration.
