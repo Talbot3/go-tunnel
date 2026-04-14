@@ -722,6 +722,263 @@ func (p *MyProtocol) Forwarder() forward.Forwarder {
 }
 ```
 
+## 使用场景
+
+### 1. API 网关底层协议转发
+
+go-tunnel 可作为 API 网关的底层转发引擎，处理入站和出站的协议转换：
+
+```go
+// 网关场景：HTTP/2 入口 -> TCP 后端
+package main
+
+import (
+    "context"
+    "log"
+
+    "github.com/Talbot3/go-tunnel"
+    "github.com/Talbot3/go-tunnel/http2"
+)
+
+func main() {
+    // HTTP/2 监听，转发到 TCP 后端服务
+    cfg := tunnel.Config{
+        ListenAddr: ":443",
+        TargetAddr: "127.0.0.1:8080", // 后端服务
+    }
+
+    t, _ := tunnel.New(cfg)
+    t.SetProtocol(http2.New(tlsConfig))
+    t.Start(context.Background())
+
+    // 现在可以通过 HTTP/2 访问，后端无需改造
+}
+```
+
+**应用场景**：
+- 为传统 TCP 服务添加 HTTP/2、HTTP/3 支持
+- 协议升级无需修改后端代码
+- 支持 gRPC-Web 到 gRPC 的协议转换
+
+### 2. 内网穿透隧道
+
+构建内网穿透服务，支持高并发连接：
+
+```go
+// 服务端（公网）
+func serverMode() {
+    cfg := tunnel.ServerPreset()
+    cfg.ListenAddr = ":443"
+    cfg.TargetAddr = "internal-service:8080"
+    // 可处理 10000+ 并发连接
+}
+
+// 客户端（内网）
+func clientMode() {
+    cfg := tunnel.ClientPreset()
+    cfg.ListenAddr = ":8080"
+    cfg.TargetAddr = "public-server:443"
+    // 高吞吐，少量连接
+}
+```
+
+**应用场景**：
+- 远程办公访问内网服务
+- IoT 设备远程管理
+- 开发调试环境暴露
+
+### 3. 微服务间通信加密
+
+为微服务间通信自动添加 TLS 加密：
+
+```go
+// 使用自动 TLS 保护服务间通信
+mgr, _ := autotls.QuickSetup(
+    "ops@company.com",
+    "service-a.internal",
+    "service-b.internal",
+)
+
+cfg := tunnel.Config{
+    Protocol:   "http2",
+    ListenAddr: ":8443",
+    TargetAddr: "localhost:8080", // 原始服务
+    TLSConfig:  mgr.TLSConfig(),
+}
+```
+
+**应用场景**：
+- 零代码改造实现服务间 mTLS
+- 自动证书续期，运维无感知
+- 支持 Kubernetes Sidecar 模式部署
+
+### 4. 负载均衡器后端代理
+
+作为负载均衡器的后端代理层：
+
+```go
+// 多协议监听，转发到不同后端
+func multiProtocolProxy() {
+    // TCP 流量
+    go func() {
+        t, _ := tunnel.New(tunnel.Config{
+            ListenAddr: ":80",
+            TargetAddr: "tcp-backend:8080",
+        })
+        t.SetProtocol(tcp.New())
+        t.Start(context.Background())
+    }()
+
+    // HTTP/2 流量
+    go func() {
+        t, _ := tunnel.New(tunnel.Config{
+            ListenAddr: ":443",
+            TargetAddr: "http-backend:8080",
+            TLSConfig:  tlsConfig,
+        })
+        t.SetProtocol(http2.New(tlsConfig))
+        t.Start(context.Background())
+    }()
+
+    // QUIC 流量（更低延迟）
+    go func() {
+        t, _ := tunnel.New(tunnel.Config{
+            ListenAddr: ":443",
+            TargetAddr: "quic-backend:8080",
+            TLSConfig:  tlsConfig,
+        })
+        t.SetProtocol(quic.New(tlsConfig, nil))
+        t.Start(context.Background())
+    }()
+}
+```
+
+### 5. 数据库代理与连接池
+
+为数据库连接提供连接池和协议转换：
+
+```go
+// 数据库连接池代理
+import "github.com/Talbot3/go-tunnel/internal/pool"
+
+func databaseProxy() {
+    // 创建到数据库的连接池
+    dialer := pool.NewDialer("tcp", "db-master:3306", pool.ConnPoolConfig{
+        MaxIdle:     50,              // 连接池大小
+        MaxAge:      30 * time.Minute, // 连接最大存活时间
+        DialTimeout: 5 * time.Second,
+    })
+    connPool := dialer.NewPool()
+
+    // 应用层从池中获取连接
+    conn, _ := connPool.Get(ctx)
+    defer connPool.Put(conn) // 归还而非关闭
+}
+```
+
+**应用场景**：
+- 数据库读写分离代理
+- 连接池复用，减少连接开销
+- 数据库协议转换（如 MySQL -> PostgreSQL）
+
+### 6. 边缘计算与 CDN 节点
+
+在边缘节点部署高性能转发：
+
+```go
+// 边缘节点配置
+func edgeNode() {
+    cfg := tunnel.HighThroughputPreset()
+    cfg.ListenAddr = ":443"
+    cfg.TargetAddr = "origin-server:80"
+
+    // 高吞吐配置：256KB 缓冲区，4MB 背压阈值
+    // 适合视频流、大文件分发
+}
+```
+
+**应用场景**：
+- CDN 源站回源代理
+- 边缘计算节点数据转发
+- 视频流代理分发
+
+### 7. 开发调试与测试
+
+本地开发环境的快速代理：
+
+```bash
+# 一行命令启动本地代理
+proxy -protocol tcp -listen :3306 -target production-db.example.com:3306
+
+# HTTP/2 到本地服务
+proxy -protocol http2 -listen :8443 -target localhost:3000 \
+    -cert cert.pem -key key.pem
+
+# 自动 TLS（适合测试）
+proxy -protocol http2 -listen :443 -target localhost:8080 \
+    -auto-tls -email dev@example.com -domains dev.local -staging
+```
+
+**应用场景**：
+- 本地连接远程数据库/服务
+- HTTPS 本地开发环境
+- 接口调试与抓包
+
+## 借鉴来源
+
+本项目的设计借鉴了以下优秀开源项目的思想：
+
+### 核心技术借鉴
+
+| 项目 | 借鉴内容 |
+|------|----------|
+| [frp](https://github.com/fatedier/frp) | 内网穿透架构设计、多协议支持模式 |
+| [nginx](https://nginx.org/) | 事件驱动模型、连接池管理、背压控制思想 |
+| [envoy](https://www.envoyproxy.io/) | 协议抽象层设计、可扩展架构 |
+| [caddy](https://caddyserver.com/) | 自动 TLS 证书管理（certmagic） |
+| [traefik](https://traefik.io/) | 配置热加载、动态路由思想 |
+| [gost](https://github.com/go-gost/gost) | 隧道链式转发、多协议适配 |
+
+### 性能优化借鉴
+
+| 技术 | 来源 | 应用 |
+|------|------|------|
+| `splice` 零拷贝 | Linux 内核、nginx | Linux 平台零拷贝转发 |
+| `TCP_NOTSENT_LOWAT` | macOS 文档、nginx | macOS 发送缓冲区优化 |
+| IOCP 大缓冲区 | Windows 文档、libuv | Windows 平台优化 |
+| `sync.Pool` 缓冲池 | Go 标准库、fasthttp | 内存复用，减少 GC |
+| 背压控制 | reactive streams、nginx | 防止内存溢出 |
+
+### 协议实现借鉴
+
+| 协议 | 参考实现 |
+|------|----------|
+| HTTP/2 | `golang.org/x/net/http2`、nginx |
+| HTTP/3 | `github.com/quic-go/quic-go`、cloudflare quiche |
+| QUIC | Google QUIC 设计文档、quic-go |
+| TLS 自动化 | Caddy certmagic、Let's Encrypt 客户端 |
+
+### 设计模式借鉴
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    设计模式借鉴                              │
+├─────────────────────────────────────────────────────────────┤
+│  Strategy Pattern    │ 协议处理器可插拔 (Protocol 接口)     │
+│  Factory Pattern     │ 平台特定转发器工厂                   │
+│  Object Pool Pattern │ sync.Pool 缓冲池、连接池             │
+│  Observer Pattern    │ 统计信息、事件回调                   │
+│  Builder Pattern     │ 配置预设 (ServerPreset 等)           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 特别感谢
+
+- [Go 团队](https://golang.org/) - 提供优秀的 netpoll 运行时
+- [quic-go 团队](https://github.com/quic-go) - 高质量的 QUIC 实现
+- [Caddy 团队](https://github.com/caddyserver) - certmagic 自动证书管理
+- [Cloudflare](https://blog.cloudflare.com/) - QUIC/HTTP/3 技术博客
+
 ## 依赖
 
 - `golang.org/x/sys` - 系统调用
