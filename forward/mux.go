@@ -736,7 +736,10 @@ func (f *bidirectionalMuxForwarder) ForwardBidirectionalMux(
 				switch msgType {
 				case MsgTypeData, MsgTypeResponse:
 					if len(payload) > 0 {
-						localConn.Write(payload)
+						if _, writeErr := localConn.Write(payload); writeErr != nil {
+							errCh <- fmt.Errorf("write to local connection: %w", writeErr)
+							return
+						}
 					}
 				case MsgTypeClose:
 					localConn.Close()
@@ -827,7 +830,11 @@ func (m *MuxConnManager) AddConnection(connID string, localConn net.Conn) {
 	// Start forwarding
 	go func() {
 		m.forwarder.ForwardMux(m.ctx, localConn, countingMuxConn, connID, m.encoder)
-		m.RemoveConnection(connID)
+		// Inline cleanup to avoid double decrement from RemoveConnection
+		if conn, loaded := m.connections.LoadAndDelete(connID); loaded {
+			conn.(net.Conn).Close()
+			m.activeConns.Add(-1)
+		}
 	}()
 }
 

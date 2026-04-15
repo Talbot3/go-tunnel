@@ -653,12 +653,13 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 	buf := s.bufferPool.Get()
 	defer s.bufferPool.Put(buf)
 
-	// Wait for both directions to complete
-	done := make(chan struct{}, 2)
+	// Use a single done channel - when either direction exits, cancel the other
+	done := make(chan struct{}, 1)
 
 	// External -> Stream
 	go func() {
 		defer func() {
+			cancel() // Cancel the other direction
 			done <- struct{}{}
 		}()
 		for {
@@ -671,7 +672,9 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 			if err != nil {
 				return
 			}
-			stream.Write((*buf)[:n])
+			if _, err := stream.Write((*buf)[:n]); err != nil {
+				return
+			}
 			s.bytesOut.Add(int64(n))
 		}
 	}()
@@ -679,6 +682,7 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 	// Stream -> External
 	go func() {
 		defer func() {
+			cancel() // Cancel the other direction
 			done <- struct{}{}
 		}()
 		for {
@@ -691,13 +695,14 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 			if err != nil {
 				return
 			}
-			extConn.Write((*buf)[:n])
+			if _, err := extConn.Write((*buf)[:n]); err != nil {
+				return
+			}
 			s.bytesIn.Add(int64(n))
 		}
 	}()
 
-	// Wait for both directions to complete
-	<-done
+	// Wait for either direction to complete (the other will be cancelled via context)
 	<-done
 }
 
@@ -711,11 +716,12 @@ func (s *MuxServer) closeTunnel(tunnel *Tunnel) {
 		tunnel.Conn.CloseWithError(0, "tunnel closed")
 	}
 
-	// Close external connections
+	// Close external connections - use LoadAndDelete to avoid duplicate processing
 	tunnel.ExternalConns.Range(func(key, value interface{}) bool {
-		conn := value.(net.Conn)
-		conn.Close()
-		s.activeConns.Add(-1)
+		if conn, loaded := tunnel.ExternalConns.LoadAndDelete(key); loaded {
+			conn.(net.Conn).Close()
+			s.activeConns.Add(-1)
+		}
 		return true
 	})
 
@@ -1215,14 +1221,33 @@ func (s *MuxClient) handleData(payload []byte) {
 	// Parse: [conn_id_len:2][conn_id][data_len:4][data]
 	offset := 0
 
-	connIDLen := binary.BigEndian.Uint16(payload[offset:])
-	offset += 2
-	connID := string(payload[offset : offset+int(connIDLen)])
-	offset += int(connIDLen)
+	// Validate minimum length
+	if len(payload) < 2 {
+		return
+	}
 
-	dataLen := binary.BigEndian.Uint32(payload[offset:])
+	connIDLen := int(binary.BigEndian.Uint16(payload[offset:]))
+	offset += 2
+
+	// Validate connID bounds
+	if offset+connIDLen > len(payload) {
+		return
+	}
+	connID := string(payload[offset : offset+connIDLen])
+	offset += connIDLen
+
+	// Validate dataLen bounds
+	if offset+4 > len(payload) {
+		return
+	}
+	dataLen := int(binary.BigEndian.Uint32(payload[offset:]))
 	offset += 4
-	data := payload[offset : offset+int(dataLen)]
+
+	// Validate data bounds
+	if offset+dataLen > len(payload) {
+		return
+	}
+	data := payload[offset : offset+dataLen]
 
 	// Write to local connection
 	if conn, ok := s.localConns.Load(connID); ok {
@@ -1366,7 +1391,10 @@ func (m *PortManager) Release(port int) {
 // generateID generates a random ID
 func generateID() string {
 	b := make([]byte, 8)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to timestamp-based ID if random fails
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
 	return fmt.Sprintf("%x", b)
 }
 
@@ -1427,6 +1455,11 @@ func parseRegisterPayload(payload []byte) (tunnelID string, protocol byte, local
 	}
 	protocol = payload[offset]
 	offset++
+
+	// Validate protocol
+	if protocol != ProtocolTCP && protocol != ProtocolHTTP {
+		return "", 0, "", "", fmt.Errorf("invalid protocol: %d (expected %d or %d)", protocol, ProtocolTCP, ProtocolHTTP)
+	}
 
 	// Read local address
 	if offset+2 > len(payload) {
