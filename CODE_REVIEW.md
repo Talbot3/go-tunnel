@@ -1,29 +1,46 @@
-# go-tunnel 代码审查报告
+# go-tunnel 集成部署视角代码审查报告
 
-**审查日期**: 2026-04-14
+**审查日期**: 2026-04-15
+**审查视角**: 作为嵌入式库的集成与部署
 **审查范围**: 全部源代码
-**版本**: 1.0.0
 
 ---
 
-## 📊 总体评估
+## 📊 库集成评估
 
 | 维度 | 评分 | 说明 |
 |------|------|------|
-| 架构设计 | ⭐⭐⭐⭐⭐ | 分层清晰，协议与传输解耦，扩展性强 |
-| 代码质量 | ⭐⭐⭐⭐⭐ | 命名规范，注释完整，实现完善 |
-| 并发安全 | ⭐⭐⭐⭐⭐ | 正确使用 atomic、sync.Mutex，无明显竞态 |
+| API 设计 | ⭐⭐⭐⭐⭐ | 简洁清晰，配置预设降低使用门槛 |
+| 可扩展性 | ⭐⭐⭐⭐⭐ | Protocol 接口设计优秀 |
+| 文档完整 | ⭐⭐⭐⭐⭐ | GoDoc 注释完整，集成示例丰富 |
 | 错误处理 | ⭐⭐⭐⭐⭐ | 错误定义清晰，边界情况处理完善 |
-| 测试覆盖 | ⭐⭐⭐⭐ | 核心模块有测试，覆盖率较好 |
-| 文档完整 | ⭐⭐⭐⭐⭐ | GoDoc 注释完整，README 详细 |
+| 资源管理 | ⭐⭐⭐⭐⭐ | 正确实现关闭和清理 |
+| 监控集成 | ⭐⭐⭐⭐ | Prometheus 指标完善 |
 
-**总体评分**: ⭐⭐⭐⭐⭐ (4.7/5.0)
+**总体评分**: ⭐⭐⭐⭐⭐ (4.8/5.0)
 
 ---
 
-## ✅ 优秀设计
+## ✅ 优秀的集成设计
 
-### 1. 协议抽象层设计 (Strategy Pattern)
+### 1. 配置预设模式
+
+**文件**: `tunnel.go:583-639`
+
+```go
+// 服务器预设 - 高并发场景
+cfg := tunnel.ServerPreset()
+
+// 客户端预设 - 高吞吐场景
+cfg := tunnel.ClientPreset()
+
+// 高吞吐预设 - 大数据传输
+cfg := tunnel.HighThroughputPreset()
+```
+
+**评价**: 预设模式大大降低了用户配置复杂度，用户无需理解所有参数即可获得优化配置。
+
+### 2. 协议接口抽象
 
 **文件**: `tunnel.go:78-90`
 
@@ -36,312 +53,242 @@ type Protocol interface {
 }
 ```
 
-**评价**: 接口设计简洁，职责单一，符合依赖倒置原则。新增协议只需实现 4 个方法。这种设计使得协议切换变得非常简单。
+**评价**: 接口简洁，用户可以轻松实现自定义协议。
 
-### 2. 平台差异化实现 (Platform-Specific Optimization)
-
-**文件**: `forward/forward_linux.go`, `forward/forward_darwin.go`, `forward/forward_windows.go`
-
-**评价**: 使用 `//go:build` 构建约束实现平台隔离，编译时确定实现，零运行时开销。
-
-```go
-//go:build linux    // Linux 零拷贝
-//go:build darwin || freebsd  // macOS 优化
-//go:build windows  // Windows IOCP
-```
-
-### 3. 零拷贝转发 (Linux Splice)
-
-**文件**: `forward/forward_linux.go`
-
-**评价**: 深度利用 Linux splice 系统调用，数据在内核态直接移动，绕过用户态内存拷贝。这是性能优化的典范实现。
-
-```go
-n, err := unix.Splice(srcFd, nil, dstFd, nil, spliceSize, flags)
-```
-
-### 4. 自适应背压控制 (Adaptive Backpressure)
-
-**文件**: `internal/backpressure/backpressure.go:111-240`
-
-**评价**:
-- 实现了 Reactive Streams 思想的水位控制
-- 指数退避机制避免 CPU 空转
-- 统计信息支持监控
-- 高低水位线防止内存溢出
-
-```go
-// 指数退避
-c.yieldCurrent *= 2
-if c.yieldCurrent > c.yieldMax {
-    c.yieldCurrent = c.yieldMax
-}
-```
-
-### 5. 连接池设计 (Connection Pool)
-
-**文件**: `internal/pool/connpool.go`
-
-**评价**:
-- 工厂模式创建连接
-- 支持连接最大存活时间
-- 统计信息完善（创建/复用/关闭/等待）
-- 健康检查机制
-
-### 6. 连接管理器 (Connection Manager)
-
-**文件**: `internal/connmgr/connmgr.go`
-
-**评价**:
-- 信号量模式实现连接限制
-- WrappedConn 自动跟踪活动状态
-- 支持优雅关闭
-- 流量统计
-
-### 7. 缓冲池设计 (Buffer Pool)
-
-**文件**: `internal/pool/pool.go`
-
-**评价**:
-- 使用 sync.Pool 减少 GC 压力
-- 分级缓冲（8KB/64KB/256KB/512KB）
-- 动态缓冲选择
-
-### 8. 自动 TLS 管理 (Auto TLS)
-
-**文件**: `tls/auto.go`
-
-**评价**:
-- 集成 certmagic，支持 Let's Encrypt/ZeroSSL
-- 支持 HTTP-01 和 DNS-01 验证
-- 自动续期，运维无感知
-
-### 9. 配置预设模式 (Configuration Presets)
-
-**文件**: `tunnel.go:583-639`
-
-**评价**: 提供了 ServerPreset、ClientPreset、HighThroughputPreset 三种预设配置，降低使用门槛。
-
-### 10. 完善的统计系统
+### 3. 统计信息接口
 
 **文件**: `tunnel.go:226-267`
 
-**评价**: 使用 atomic 操作实现线程安全的统计，支持重置功能。
+```go
+type Stats struct {
+    connections atomic.Int64
+    bytesSent   atomic.Int64
+    bytesRecv   atomic.Int64
+    errors      atomic.Int64
+}
+
+func (s *Stats) Connections() int64
+func (s *Stats) BytesSent() int64
+func (s *Stats) Reset()
+```
+
+**评价**: 统计信息线程安全，支持重置，用户可以轻松集成到监控系统。
+
+### 4. 便捷函数
+
+**文件**: `tunnel.go:457-523`
+
+```go
+// 极简模式
+go tunnel.HandlePair(src, dst)
+
+// 双向转发
+tunnel.Forward(src, dst)
+
+// 创建转发器
+fwd := tunnel.NewForwarder()
+```
+
+**评价**: 提供多层次的 API，从极简到完全控制，满足不同场景需求。
+
+### 5. 自动 TLS 集成
+
+**文件**: `tls/auto.go`
+
+```go
+// 一行设置自动 TLS
+mgr, _ := autotls.QuickSetup("admin@example.com", "example.com")
+tlsConfig := mgr.TLSConfig()
+```
+
+**评价**: 自动证书管理大大简化了 HTTPS 部署。
+
+### 6. 内部包暴露
+
+**文件**: `internal/connmgr`, `internal/pool`, `internal/metrics`
+
+**评价**: 内部包设计合理，用户可以按需使用：
+- `connmgr` - 服务器场景连接管理
+- `pool` - 客户端场景连接池
+- `metrics` - Prometheus 监控集成
 
 ---
 
-## 🔍 代码质量分析
+## ⚠️ 集成场景发现的问题
 
-### 并发安全
+### 1. Tunnel 缺少 IsHealthy 方法 [低优先级]
 
-| 组件 | 实现方式 | 评价 |
-|------|----------|------|
-| Stats | atomic.Int64 | ✅ 正确使用 |
-| BufferPool | sync.Pool | ✅ 正确使用 |
-| ConnectionManager | sync.Map + atomic | ✅ 正确使用 |
-| Backpressure | sync.Mutex + atomic.Bool | ✅ 正确使用 |
-| Tunnel | sync.WaitGroup | ✅ 正确使用 |
+**影响**: 用户实现健康检查时需要自行判断
 
-### 错误处理
+**现状**:
+```go
+// 用户需要自己实现健康检查
+http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+    // 没有标准方法判断隧道是否健康
+    stats := t.Stats()
+    // 用户需要自己定义健康标准
+})
+```
 
-**文件**: `errors.go`, `forward/forward.go:29-55`
+**建议**: 添加 `IsHealthy()` 方法
 
 ```go
-func IsClosedErr(err error) bool {
-    if err == nil {
-        return true
-    }
-    if err == io.EOF {
-        return true
-    }
-    // 检查 syscall 错误
-    switch err {
-    case syscall.EPIPE, syscall.ECONNRESET, syscall.ECONNABORTED:
-        return true
-    }
-    // 检查 net.OpError
-    if opErr, ok := err.(*net.OpError); ok {
-        // ...
-    }
-    return false
+func (t *Tunnel) IsHealthy() bool {
+    return t.listener != nil && t.cancel != nil
 }
 ```
 
-**评价**: 错误判断全面，覆盖了常见场景。
+**影响范围**: 小，用户可以自行实现
 
-### 资源管理
+---
 
-**文件**: `tunnel.go:387-436`
+### 2. Stats 缺少时间戳 [低优先级]
 
+**影响**: 监控系统无法知道统计信息的采集时间
+
+**建议**:
 ```go
-func (t *Tunnel) handleConnection(ctx context.Context, src net.Conn) {
-    // 设置连接超时
-    if t.config.ConnectionTimeout > 0 {
-        src.SetDeadline(time.Now().Add(t.config.ConnectionTimeout))
-    }
-    
-    // ... 转发逻辑 ...
-    
-    // 确保关闭连接
-    src.Close()
-    dst.Close()
+type Stats struct {
+    // ...
+    lastUpdate atomic.Int64 // Unix nano
+}
+
+func (s *Stats) LastUpdate() time.Time {
+    return time.Unix(0, s.lastUpdate.Load())
 }
 ```
 
-**评价**: 正确实现了超时控制和资源清理。
+**影响范围**: 小，用户可以在采集时自行记录时间
 
 ---
 
-## 🧪 测试覆盖
+### 3. 缺少连接回调钩子 [低优先级]
 
-| 包 | 测试文件 | 覆盖情况 |
-|----|----------|----------|
-| tunnel | `tunnel_test.go` | ✅ 集成测试完整 |
-| forward | `forward_test.go` | ✅ 基础测试 |
-| internal/pool | `pool_test.go`, `connpool_test.go` | ✅ 完整测试 |
-| internal/backpressure | `backpressure_test.go` | ✅ 完整测试 |
-| internal/connmgr | `connmgr_test.go` | ✅ 完整测试 |
-| tcp/http2/http3/quic | - | ⚠️ 需要添加单元测试 |
-| tls | - | ⚠️ 需要添加单元测试 |
+**影响**: 用户无法在连接建立/关闭时执行自定义逻辑
 
----
-
-## ⚠️ 潜在改进点
-
-### 1. HTTP/2 流多路复用未完全利用 [低优先级]
-
-**文件**: `http2/http2.go`
-
-**现状**: 当前 HTTP/2 实现作为简单转发，未充分利用 HTTP/2 的流多路复用特性。
-
-**建议**: 对于需要多路复用的场景，可以考虑实现流级别的转发。
-
-### 2. QUIC 单流模式限制已文档化 [已解决]
-
-**文件**: `quic/quic.go:9-13`
-
+**建议**:
 ```go
-// # Limitations
-//
-// The current implementation uses a single QUIC stream per connection.
-// While QUIC supports multiplexing multiple streams over a single connection,
-// this package uses one stream to maintain net.Conn interface compatibility.
+type Config struct {
+    // ...
+    OnConnect func(conn net.Conn)
+    OnDisconnect func(conn net.Conn)
+}
 ```
 
-**评价**: 已在代码和 README 中明确说明限制。
-
-### 3. DNS Provider 需要显式导入 [文档说明]
-
-**文件**: `tls/dns_provider.go`
-
-**现状**: DNS Provider 返回错误提示用户导入具体的 libdns 包。
-
-**建议**: 在 README 中添加 DNS Provider 配置示例。
-
-### 4. 监控指标导出 [已实现]
-
-**文件**: `internal/metrics/metrics.go`
-
-**现状**: 已添加 Prometheus 指标导出支持。
-
-**实现**:
-- 连接指标 (总数、活跃数)
-- 流量指标 (发送/接收字节)
-- 延迟指标 (连接持续时间、转发延迟)
-- 连接池指标 (创建、复用、关闭)
-- 背压指标 (暂停次数、让出时间)
+**影响范围**: 小，用户可以通过包装 Listener 实现
 
 ---
 
-## 🔒 安全审查
+### 4. 配置验证缺失 [低优先级]
 
-### ✅ 通过项
+**影响**: 无效配置在运行时才发现
 
-1. **TLS 配置安全**: `cmd/proxy/main.go:305-341` 使用 TLS 1.2+ 和安全加密套件
-2. **证书验证**: QUIC/HTTP/3 正确配置 NextProtos
-3. **无硬编码密钥**: 证书路径通过配置/命令行指定
-4. **连接超时**: 防止连接泄漏
-5. **资源限制**: 支持 MaxConnections 配置
+**建议**:
+```go
+func (c *Config) Validate() error {
+    if c.ListenAddr == "" {
+        return errors.New("listen address required")
+    }
+    if c.TargetAddr == "" {
+        return errors.New("target address required")
+    }
+    // ...
+    return nil
+}
+```
 
-### ⚠️ 注意项
-
-1. **证书存储路径**: 默认使用 `~/.local/share/go-tunnel/certs`，建议检查目录权限
-2. **DNS Provider 凭证**: 通过环境变量读取，符合 12-Factor 原则
-
----
-
-## 📈 性能特性
-
-| 特性 | Linux | macOS | Windows |
-|------|-------|-------|---------|
-| 零拷贝 | ✅ splice | - | - |
-| TCP_NODELAY | ✅ | ✅ | ✅ |
-| TCP_QUICKACK | ✅ | - | - |
-| TCP_FASTOPEN | ✅ | ✅ | ✅ |
-| 大缓冲区 | ✅ | ✅ | ✅ (IOCP) |
-| 背压控制 | ✅ | ✅ | ✅ |
+**影响范围**: 小，New() 会返回错误
 
 ---
 
-## 📝 代码风格
+## 📋 集成场景功能矩阵
 
-### 命名规范
-
-- ✅ 包名小写，简洁
-- ✅ 接口名动词或名词
-- ✅ 常量全大写或驼峰
-- ✅ 导出函数有注释
-
-### 注释质量
-
-- ✅ Package 注释完整
-- ✅ 函数注释说明参数和返回值
-- ✅ 复杂逻辑有行内注释
-- ✅ 示例代码在注释中
+| 功能 | TCP | HTTP/2 | HTTP/3 | QUIC | 用户实现 |
+|------|:---:|:------:|:------:|:----:|:--------:|
+| 基础转发 | ✅ | ✅ | ✅ | ✅ | - |
+| TLS 支持 | - | ✅ | ✅ | ✅ | - |
+| 自动证书 | - | ✅ | ✅ | ✅ | - |
+| 统计信息 | ✅ | ✅ | ✅ | ✅ | - |
+| Prometheus | ✅ | ✅ | ✅ | ✅ | 可选集成 |
+| 健康检查 | - | - | - | - | 用户实现 |
+| 配置热加载 | - | - | - | - | 用户实现 |
+| 认证授权 | - | - | - | - | 用户实现 |
 
 ---
 
-## 🎯 总结
+## 🎯 集成建议
 
-go-tunnel 是一个设计优秀、架构清晰的高性能转发库。
+### 库的职责边界
 
-### 核心优势
+go-tunnel 作为核心转发库，职责清晰：
 
-1. **零拷贝转发**: Linux splice 系统调用实现真正的零拷贝
-2. **平台优化**: 针对三大平台分别优化
-3. **协议抽象**: 易于扩展新协议
-4. **背压控制**: 防止内存溢出
-5. **自动 TLS**: 运维友好
-6. **配置预设**: 降低使用门槛
-7. **完善的统计**: 支持监控
+**库负责**:
+- ✅ 高性能数据转发
+- ✅ 多协议支持
+- ✅ 平台优化
+- ✅ TLS 证书管理
+- ✅ 连接池/管理
+- ✅ 统计信息
+- ✅ Prometheus 指标
 
-### 已完成的改进
+**用户负责**:
+- 健康检查端点
+- 配置热加载
+- 认证授权
+- 日志格式化
+- 业务逻辑集成
 
-1. ✅ 添加协议级别的单元测试 (tcp, http2, http3, quic)
-2. ✅ 添加 Prometheus 指标导出 (`internal/metrics` 包)
-3. ✅ 完善 DNS Provider 配置文档 (README.md 详细配置说明)
+这种职责分离是正确的，保持了库的专注性和灵活性。
 
-### 可选改进方向
+### 集成最佳实践
 
-1. 优化缓冲池 Put 方法 (性能微优化)
-2. 添加健康检查端点 (可选功能)
-
-### 最终评价
-
-**生产可用，代码质量优秀，架构设计典范。**
+1. **使用配置预设**: 根据场景选择 ServerPreset/ClientPreset
+2. **实现健康检查**: 在用户应用中添加 /health 端点
+3. **集成监控**: 使用 internal/metrics 包暴露 Prometheus 指标
+4. **优雅关闭**: 监听 SIGINT/SIGTERM 信号调用 Stop()
+5. **资源管理**: 在容器中设置合适的资源限制
 
 ---
 
-## 📋 检查清单
+## 📝 改进建议
 
-- [x] 架构设计清晰
-- [x] 并发安全
-- [x] 错误处理完善
-- [x] 资源管理正确
-- [x] TLS 配置安全
-- [x] 文档完整
-- [x] 核心测试覆盖
-- [x] 连接超时支持
-- [x] 统计重置功能
-- [x] QUIC 限制文档化
-- [x] Windows 常量定义
+### 可选改进 (非必需)
+
+| 改进 | 优先级 | 工作量 | 说明 |
+|------|--------|--------|------|
+| 添加 IsHealthy() 方法 | 低 | 低 | 方便用户实现健康检查 |
+| 添加配置验证方法 | 低 | 低 | 提前发现配置错误 |
+| 添加连接回调钩子 | 低 | 中 | 支持自定义连接处理 |
+
+### 不建议添加的功能
+
+以下功能应由用户在应用层实现，不应加入库：
+
+- ❌ HTTP 健康检查服务器 (用户应用自行实现)
+- ❌ 配置文件热加载 (用户应用自行实现)
+- ❌ 认证授权中间件 (用户应用自行实现)
+- ❌ 结构化日志 (用户应用自行选择日志库)
+
+---
+
+## 🔍 代码质量总结
+
+### 优点
+
+1. **API 设计优秀**: 分层清晰，从极简到完全控制
+2. **配置预设**: 降低使用门槛
+3. **协议抽象**: 易于扩展
+4. **资源管理**: 正确实现关闭和清理
+5. **文档完整**: GoDoc 注释完整
+
+### 建议
+
+1. 添加 `IsHealthy()` 方法方便健康检查
+2. 添加配置验证方法
+3. 在 README 中添加更多集成示例
+
+### 结论
+
+**go-tunnel 是一个设计优秀的嵌入式转发库**，职责边界清晰，API 设计合理。用户可以轻松集成到自己的应用中，并根据业务需求添加健康检查、认证等功能。
+
+**生产就绪度**: ⭐⭐⭐⭐⭐ (5/5)
