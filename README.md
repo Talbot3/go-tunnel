@@ -423,6 +423,153 @@ func main() {
 | DigitalOcean | `github.com/libdns/digitalocean` |
 | GoDaddy | `github.com/libdns/godaddy` |
 
+### DNS 提供商配置详解
+
+#### 环境变量配置
+
+DNS 提供商凭证通过环境变量配置，符合 12-Factor 应用原则：
+
+```bash
+# Cloudflare
+export CLOUDFLARE_API_TOKEN=your-api-token
+# 或使用 API Key（不推荐）
+export CLOUDFLARE_EMAIL=your-email@example.com
+export CLOUDFLARE_API_KEY=your-api-key
+
+# 阿里云 DNS
+export ALIDNS_ACCESS_KEY_ID=your-access-key-id
+export ALIDNS_ACCESS_KEY_SECRET=your-access-key-secret
+
+# AWS Route53（使用标准 AWS 凭证）
+export AWS_ACCESS_KEY_ID=your-access-key-id
+export AWS_SECRET_ACCESS_KEY=your-secret-access-key
+export AWS_REGION=us-east-1
+
+# DigitalOcean
+export DIGITALOCEAN_TOKEN=your-api-token
+
+# GoDaddy
+export GODADDY_API_KEY=your-api-key
+export GODADDY_API_SECRET=your-api-secret
+```
+
+#### 完整示例：Cloudflare DNS-01
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "os"
+
+    "github.com/libdns/cloudflare"
+    autotls "github.com/Talbot3/go-tunnel/tls"
+)
+
+func main() {
+    // 1. 从环境变量获取凭证
+    apiToken := os.Getenv("CLOUDFLARE_API_TOKEN")
+    if apiToken == "" {
+        log.Fatal("CLOUDFLARE_API_TOKEN not set")
+    }
+
+    // 2. 创建 DNS 提供商
+    dnsProvider := &cloudflare.Provider{
+        APIToken: apiToken,
+    }
+
+    // 3. 创建自动证书管理器
+    mgr := autotls.NewAutoManager(autotls.AutoManagerConfig{
+        Email:       "admin@example.com",
+        AgreeTerms:  true,
+        UseDNS01:    true,
+        DNSProvider: dnsProvider,
+    })
+
+    // 4. 添加域名（支持通配符）
+    if err := mgr.AddDomains("example.com", "*.example.com"); err != nil {
+        log.Fatal(err)
+    }
+
+    // 5. 获取 TLS 配置用于服务
+    tlsConfig := mgr.TLSConfig()
+    // ... 使用 tlsConfig 启动服务
+}
+```
+
+#### 完整示例：阿里云 DNS-01
+
+```go
+package main
+
+import (
+    "log"
+    "os"
+
+    "github.com/libdns/alidns"
+    autotls "github.com/Talbot3/go-tunnel/tls"
+)
+
+func main() {
+    // 创建阿里云 DNS 提供商
+    dnsProvider := &alidns.Provider{
+        AccessKeyID:     os.Getenv("ALIDNS_ACCESS_KEY_ID"),
+        AccessKeySecret: os.Getenv("ALIDNS_ACCESS_KEY_SECRET"),
+    }
+
+    mgr := autotls.NewAutoManager(autotls.AutoManagerConfig{
+        Email:       "admin@example.com",
+        AgreeTerms:  true,
+        UseDNS01:    true,
+        DNSProvider: dnsProvider,
+    })
+
+    // 支持通配符域名
+    mgr.AddDomains("example.cn", "*.example.cn")
+}
+```
+
+#### DNS-01 vs HTTP-01 对比
+
+| 特性 | HTTP-01 | DNS-01 |
+|------|---------|--------|
+| 适用场景 | 公网服务器 | 内网服务器、通配符证书 |
+| 端口要求 | 需要 80 端口可访问 | 无端口要求 |
+| 通配符支持 | ❌ 不支持 | ✅ 支持 |
+| 配置复杂度 | 简单 | 需要 DNS 提供商 API |
+| 验证速度 | 较快 | 较慢（需 DNS 传播） |
+
+#### 常见问题
+
+**Q: 为什么 DNS Provider 返回错误？**
+
+A: 需要导入具体的 libdns 包。例如使用 Cloudflare：
+
+```go
+import _ "github.com/libdns/cloudflare" // 确保导入
+```
+
+**Q: DNS-01 验证超时怎么办？**
+
+A: 增加传播超时时间：
+
+```go
+mgr := autotls.NewAutoManager(autotls.AutoManagerConfig{
+    // ... 其他配置
+})
+// certmagic 会自动处理 DNS 传播等待
+```
+
+**Q: 如何测试 DNS Provider 配置？**
+
+A: 使用测试模式避免消耗配额：
+
+```bash
+# 使用 Let's Encrypt 测试环境
+proxy -auto-tls -staging -email admin@example.com -domains test.example.com
+```
+
 ### 命令行自动 TLS
 
 ```bash
@@ -491,6 +638,114 @@ func (m *AutoManager) CacheStatus() map[string]*CertStatus
 func (m *AutoManager) UseStaging()
 func (m *AutoManager) UseProduction()
 func (m *AutoManager) UseZeroSSL()
+```
+
+## Prometheus 监控指标
+
+go-tunnel 提供可选的 Prometheus 指标导出，用于监控隧道性能和健康状态。
+
+### 基本使用
+
+```go
+import (
+    "github.com/prometheus/client_golang/prometheus/promhttp"
+    "github.com/Talbot3/go-tunnel/internal/metrics"
+)
+
+func main() {
+    // 创建指标收集器
+    collector := metrics.NewCollector(metrics.Config{
+        Namespace:                 "my_tunnel",
+        EnableConnectionDuration:  true,
+        EnableForwardLatency:      true,
+        EnablePoolMetrics:         true,
+        EnableBackpressureMetrics: true,
+    })
+
+    // 在隧道处理中使用
+    collector.IncConnections()
+    collector.AddBytesSent(1024)
+    collector.IncActive()
+    defer collector.DecActive()
+
+    // 暴露 Prometheus 端点
+    http.Handle("/metrics", promhttp.Handler())
+    http.ListenAndServe(":9090", nil)
+}
+```
+
+### 可用指标
+
+| 指标名称 | 类型 | 说明 |
+|---------|------|------|
+| `{namespace}_connections_total` | Counter | 总连接数 |
+| `{namespace}_connections_active` | Gauge | 当前活跃连接数 |
+| `{namespace}_bytes_sent_total` | Counter | 发送字节总数 |
+| `{namespace}_bytes_received_total` | Counter | 接收字节总数 |
+| `{namespace}_errors_total` | Counter | 错误总数 |
+| `{namespace}_connection_duration_seconds` | Histogram | 连接持续时间 |
+| `{namespace}_forward_latency_seconds` | Histogram | 转发延迟 |
+| `{namespace}_pool_connections_active` | Gauge | 连接池活跃连接数 |
+| `{namespace}_pool_connections_created_total` | Counter | 连接池创建连接数 |
+| `{namespace}_pool_connections_reused_total` | Counter | 连接池复用连接数 |
+| `{namespace}_backpressure_pauses_total` | Counter | 背压暂停次数 |
+
+### API 参考
+
+```go
+// 连接指标
+collector.IncConnections()
+collector.IncConnectionsBy(5)
+collector.IncActive()
+collector.DecActive()
+collector.SetActive(100)
+
+// 流量指标
+collector.AddBytesSent(1024)
+collector.AddBytesReceived(512)
+
+// 错误指标
+collector.IncErrors()
+collector.IncErrorsBy(3)
+
+// 延迟指标
+collector.ObserveConnectionDuration(0.5)  // 秒
+collector.ObserveForwardLatency(0.01)     // 秒
+
+// 连接池指标
+collector.SetPoolActive(50)
+collector.IncPoolCreated()
+collector.IncPoolReused()
+collector.IncPoolClosed()
+collector.ObservePoolWait(0.001)  // 秒
+
+// 背压指标
+collector.IncBackpressurePauses()
+collector.AddBackpressureYieldTime(0.05)  // 秒
+```
+
+### Grafana 仪表板示例
+
+```promql
+# 连接速率
+rate(my_tunnel_connections_total[5m])
+
+# 吞吐量
+rate(my_tunnel_bytes_sent_total[5m])
+rate(my_tunnel_bytes_received_total[5m])
+
+# 错误率
+rate(my_tunnel_errors_total[5m])
+
+# 平均连接持续时间
+histogram_quantile(0.5, rate(my_tunnel_connection_duration_seconds_bucket[5m]))
+
+# P99 转发延迟
+histogram_quantile(0.99, rate(my_tunnel_forward_latency_seconds_bucket[5m]))
+
+# 连接池复用率
+rate(my_tunnel_pool_connections_reused_total[5m]) / 
+rate(my_tunnel_pool_connections_created_total[5m])
 ```
 
 ## 命令行工具
