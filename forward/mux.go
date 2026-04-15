@@ -355,14 +355,14 @@ func writeInt(buf []byte, offset int, n int) int {
 	return offset
 }
 
-// EncodeData encodes a data message.
-func (e *DefaultMuxEncoder) EncodeData(connID string, data []byte) ([]byte, error) {
-	// Calculate total length: DATA:connID:len:data\n
-	connIDLen := len(connID)
+// encodeMessage is a helper function that encodes a message with the given prefix
+func (e *DefaultMuxEncoder) encodeMessage(prefix string, id string, data []byte) ([]byte, error) {
+	idLen := len(id)
 	dataLen := len(data)
+	prefixLen := len(prefix)
 
-	// Estimate max header length: "DATA:" + connID + ":" + max 10 digits + ":" = 5 + len + 1 + 10 + 1
-	maxTotalLen := 5 + connIDLen + 1 + 10 + 1 + dataLen + 1
+	// Estimate max header length: prefix + id + ":" + max 10 digits + ":" + data + delimiter
+	maxTotalLen := prefixLen + idLen + 1 + 10 + 1 + dataLen + 1
 
 	buf := e.getBuffer()
 	if cap(buf) < maxTotalLen {
@@ -372,28 +372,24 @@ func (e *DefaultMuxEncoder) EncodeData(connID string, data []byte) ([]byte, erro
 
 	offset := 0
 
-	// Write "DATA:"
-	copy(buf[offset:], "DATA:")
-	offset += 5
+	// Write prefix
+	copy(buf[offset:], prefix)
+	offset += prefixLen
 
-	// Write connID
-	copy(buf[offset:], connID)
-	offset += connIDLen
+	// Write ID
+	copy(buf[offset:], id)
+	offset += idLen
 
-	// Write ":"
-	buf[offset] = ':'
-	offset++
-
-	// Write data length
-	offset = writeInt(buf, offset, dataLen)
-
-	// Write ":"
-	buf[offset] = ':'
-	offset++
-
-	// Write data
-	copy(buf[offset:], data)
-	offset += dataLen
+	// Write ":" + length + ":" + data
+	if dataLen > 0 {
+		buf[offset] = ':'
+		offset++
+		offset = writeInt(buf, offset, dataLen)
+		buf[offset] = ':'
+		offset++
+		copy(buf[offset:], data)
+		offset += dataLen
+	}
 
 	// Write delimiter
 	buf[offset] = e.Delimiter
@@ -404,6 +400,11 @@ func (e *DefaultMuxEncoder) EncodeData(connID string, data []byte) ([]byte, erro
 	copy(result, buf[:offset])
 	e.putBuffer(buf)
 	return result, nil
+}
+
+// EncodeData encodes a data message.
+func (e *DefaultMuxEncoder) EncodeData(connID string, data []byte) ([]byte, error) {
+	return e.encodeMessage("DATA:", connID, data)
 }
 
 // EncodeClose encodes a close message.
@@ -426,66 +427,12 @@ func (e *DefaultMuxEncoder) EncodeClose(connID string) ([]byte, error) {
 
 // EncodeRequest encodes an HTTP request message.
 func (e *DefaultMuxEncoder) EncodeRequest(reqID string, data []byte) ([]byte, error) {
-	dataLen := len(data)
-	maxTotalLen := 8 + len(reqID) + 1 + 10 + 1 + dataLen + 1
-
-	buf := e.getBuffer()
-	if cap(buf) < maxTotalLen {
-		e.putBuffer(buf)
-		buf = make([]byte, maxTotalLen)
-	}
-
-	offset := 0
-	copy(buf[offset:], "REQUEST:")
-	offset += 8
-	copy(buf[offset:], reqID)
-	offset += len(reqID)
-	buf[offset] = ':'
-	offset++
-	offset = writeInt(buf, offset, dataLen)
-	buf[offset] = ':'
-	offset++
-	copy(buf[offset:], data)
-	offset += dataLen
-	buf[offset] = e.Delimiter
-	offset++
-
-	result := make([]byte, offset)
-	copy(result, buf[:offset])
-	e.putBuffer(buf)
-	return result, nil
+	return e.encodeMessage("REQUEST:", reqID, data)
 }
 
 // EncodeResponse encodes an HTTP response message.
 func (e *DefaultMuxEncoder) EncodeResponse(reqID string, data []byte) ([]byte, error) {
-	dataLen := len(data)
-	maxTotalLen := 9 + len(reqID) + 1 + 10 + 1 + dataLen + 1
-
-	buf := e.getBuffer()
-	if cap(buf) < maxTotalLen {
-		e.putBuffer(buf)
-		buf = make([]byte, maxTotalLen)
-	}
-
-	offset := 0
-	copy(buf[offset:], "RESPONSE:")
-	offset += 9
-	copy(buf[offset:], reqID)
-	offset += len(reqID)
-	buf[offset] = ':'
-	offset++
-	offset = writeInt(buf, offset, dataLen)
-	buf[offset] = ':'
-	offset++
-	copy(buf[offset:], data)
-	offset += dataLen
-	buf[offset] = e.Delimiter
-	offset++
-
-	result := make([]byte, offset)
-	copy(result, buf[:offset])
-	e.putBuffer(buf)
-	return result, nil
+	return e.encodeMessage("RESPONSE:", reqID, data)
 }
 
 // EncodeNewConn encodes a new connection notification.

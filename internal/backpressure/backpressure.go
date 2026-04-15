@@ -109,10 +109,11 @@ func (p *Pair) SignalErrorA() { p.B.Resume() }
 func (p *Pair) SignalErrorB() { p.A.Resume() }
 
 // AdaptiveController provides adaptive backpressure with exponential backoff.
+// Thread-safe for concurrent use.
 type AdaptiveController struct {
 	mu sync.Mutex
 
-	// Watermark settings
+	// Watermark settings (protected by mu)
 	highWatermark int
 	lowWatermark  int
 	currentLevel  int
@@ -123,7 +124,7 @@ type AdaptiveController struct {
 	// Exponential backoff settings
 	yieldMin     time.Duration
 	yieldMax     time.Duration
-	yieldCurrent time.Duration
+	yieldCurrent atomic.Int64 // Nanoseconds, uses atomic for lock-free access
 
 	// Statistics
 	pauseCount atomic.Int64
@@ -153,13 +154,14 @@ func NewAdaptiveController(cfg AdaptiveConfig) *AdaptiveController {
 		cfg.YieldMax = 10 * time.Millisecond
 	}
 
-	return &AdaptiveController{
+	c := &AdaptiveController{
 		highWatermark: cfg.HighWatermark,
 		lowWatermark:  cfg.LowWatermark,
 		yieldMin:      cfg.YieldMin,
 		yieldMax:      cfg.YieldMax,
-		yieldCurrent:  cfg.YieldMin,
 	}
+	c.yieldCurrent.Store(int64(cfg.YieldMin))
+	return c
 }
 
 // Pause stops data flow.
@@ -170,9 +172,7 @@ func (c *AdaptiveController) Pause() {
 // Resume allows data flow to continue.
 func (c *AdaptiveController) Resume() {
 	c.paused.Store(false)
-	c.mu.Lock()
-	c.yieldCurrent = c.yieldMin
-	c.mu.Unlock()
+	c.yieldCurrent.Store(int64(c.yieldMin))
 }
 
 // IsPaused returns whether the flow is paused.
@@ -187,19 +187,19 @@ func (c *AdaptiveController) CheckAndYield() bool {
 		return false
 	}
 
-	c.mu.Lock()
-	yieldTime := c.yieldCurrent
-	// Exponential backoff
-	c.yieldCurrent *= 2
-	if c.yieldCurrent > c.yieldMax {
-		c.yieldCurrent = c.yieldMax
+	// Lock-free exponential backoff using atomic
+	yieldTimeNs := c.yieldCurrent.Load()
+	newYieldNs := yieldTimeNs * 2
+	maxYieldNs := int64(c.yieldMax)
+	if newYieldNs > maxYieldNs {
+		newYieldNs = maxYieldNs
 	}
-	c.mu.Unlock()
+	c.yieldCurrent.Store(newYieldNs)
 
 	c.pauseCount.Add(1)
-	c.totalPause.Add(int64(yieldTime))
+	c.totalPause.Add(yieldTimeNs)
 
-	time.Sleep(yieldTime)
+	time.Sleep(time.Duration(yieldTimeNs))
 	return true
 }
 
@@ -214,7 +214,7 @@ func (c *AdaptiveController) UpdateLevel(level int) {
 		c.paused.Store(true)
 	} else if level <= c.lowWatermark {
 		c.paused.Store(false)
-		c.yieldCurrent = c.yieldMin
+		c.yieldCurrent.Store(int64(c.yieldMin))
 	}
 }
 
@@ -233,8 +233,6 @@ func (c *AdaptiveController) Stats() (pauseCount int64, totalPause time.Duration
 
 // Reset resets the backoff to minimum.
 func (c *AdaptiveController) Reset() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.yieldCurrent = c.yieldMin
+	c.yieldCurrent.Store(int64(c.yieldMin))
 	c.paused.Store(false)
 }

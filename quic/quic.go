@@ -101,6 +101,19 @@ var (
 	ErrConnectionClosed    = errors.New("connection closed")
 )
 
+// constantTimeEqual performs a constant-time comparison to prevent timing attacks.
+// Returns true if the slices are equal.
+func constantTimeEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var result byte
+	for i := 0; i < len(a); i++ {
+		result |= a[i] ^ b[i]
+	}
+	return result == 0
+}
+
 // ============================================
 // MuxServer - QUIC Multiplexing Server
 // ============================================
@@ -348,9 +361,22 @@ func (s *MuxServer) handleControlStream(conn quic.Connection, stream quic.Stream
 	}
 
 	// Authenticate
-	if s.config.AuthToken != "" && authToken != s.config.AuthToken {
-		s.sendRegisterAck(stream, tunnelID, "", 0, "authentication failed")
-		return
+	if s.config.AuthToken != "" {
+		// Use constant-time comparison to prevent timing attacks
+		authTokenBytes := []byte(authToken)
+		expectedTokenBytes := []byte(s.config.AuthToken)
+		if !constantTimeEqual(authTokenBytes, expectedTokenBytes) {
+			s.sendRegisterAck(stream, tunnelID, "", 0, "authentication failed")
+			// Clear sensitive data from memory
+			for i := range authTokenBytes {
+				authTokenBytes[i] = 0
+			}
+			return
+		}
+		// Clear sensitive data from memory
+		for i := range authTokenBytes {
+			authTokenBytes[i] = 0
+		}
 	}
 
 	// Check tunnel limit

@@ -53,6 +53,7 @@ package tunnel
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -288,11 +289,9 @@ func New(cfg Config) (*Tunnel, error) {
 // NewWithContext creates a new Tunnel with the given context and configuration.
 // The context can be used to cancel the tunnel creation if it takes too long.
 func NewWithContext(ctx context.Context, cfg Config) (*Tunnel, error) {
-	if cfg.BufferSize == 0 {
-		cfg.BufferSize = pool.DefaultBufferSize
-	}
-	if cfg.Protocol == "" {
-		cfg.Protocol = "tcp"
+	// Validate configuration
+	if err := validateConfig(&cfg); err != nil {
+		return nil, err
 	}
 
 	return &Tunnel{
@@ -301,6 +300,51 @@ func NewWithContext(ctx context.Context, cfg Config) (*Tunnel, error) {
 			startTime: time.Now(),
 		},
 	}, nil
+}
+
+// validateConfig validates and sets defaults for the configuration.
+func validateConfig(cfg *Config) error {
+	// Validate BufferSize
+	if cfg.BufferSize < 0 {
+		return fmt.Errorf("BufferSize must be non-negative, got %d", cfg.BufferSize)
+	}
+	if cfg.BufferSize == 0 {
+		cfg.BufferSize = pool.DefaultBufferSize
+	}
+
+	// Validate Protocol
+	if cfg.Protocol == "" {
+		cfg.Protocol = "tcp"
+	}
+
+	// Validate MaxConnections
+	if cfg.MaxConnections < 0 {
+		return fmt.Errorf("MaxConnections must be non-negative, got %d", cfg.MaxConnections)
+	}
+
+	// Validate buffer sizes
+	if cfg.ReadBufferSize < 0 {
+		return fmt.Errorf("ReadBufferSize must be non-negative, got %d", cfg.ReadBufferSize)
+	}
+	if cfg.WriteBufferSize < 0 {
+		return fmt.Errorf("WriteBufferSize must be non-negative, got %d", cfg.WriteBufferSize)
+	}
+
+	// Validate backpressure watermarks
+	if cfg.BackpressureHighWatermark < 0 {
+		return fmt.Errorf("BackpressureHighWatermark must be non-negative, got %d", cfg.BackpressureHighWatermark)
+	}
+	if cfg.BackpressureLowWatermark < 0 {
+		return fmt.Errorf("BackpressureLowWatermark must be non-negative, got %d", cfg.BackpressureLowWatermark)
+	}
+	if cfg.BackpressureHighWatermark > 0 && cfg.BackpressureLowWatermark > 0 {
+		if cfg.BackpressureLowWatermark >= cfg.BackpressureHighWatermark {
+			return fmt.Errorf("BackpressureLowWatermark (%d) must be less than BackpressureHighWatermark (%d)",
+				cfg.BackpressureLowWatermark, cfg.BackpressureHighWatermark)
+		}
+	}
+
+	return nil
 }
 
 // SetProtocol sets a custom protocol handler for the tunnel.
