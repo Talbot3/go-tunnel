@@ -1,5 +1,7 @@
 # go-tunnel 多路复用协议封包方案审查报告
 
+> **状态更新 (2026-04-15)**: 本报告中的 P0 优化项已全部实施完成。
+
 ## 一、审查概述
 
 本报告对 `forward/mux.go` 和 `docs/MUX_TUNNEL_DESIGN.md` 中的协议封包方案进行审查，评估是否充分使用了系统优化接口。
@@ -602,3 +604,50 @@ func (p *BinaryProtocol) Release(buf []byte) {
 - **延迟**: 100 µs → 10 µs (10x)
 - **内存**: 高 GC → 低 GC (10x)
 - **CPU**: 高 → 低 (3x)
+
+---
+
+## 九、实施状态 (2026-04-15)
+
+### 已完成优化
+
+| 优先级 | 项目 | 状态 | 说明 |
+|--------|------|------|------|
+| P0 | 缓冲池集成 | ✅ 已完成 | `MuxForwarder`、`BidirectionalMuxForwarder`、`MuxConnManager` 均使用 `pool.BufferPool` |
+| P0 | 背压控制 | ✅ 已完成 | 所有转发器集成 `backpressure.Controller` |
+| P0 | 二进制协议 | ✅ 已完成 | `BinaryProtocol` 实现高效二进制编码 |
+| P1 | TCP 优化 | ✅ 已完成 | `MuxConnManager.AddConnection` 自动应用 `OptimizeTCPConn` |
+| P1 | Release 方法 | ✅ 已完成 | `DefaultMuxEncoder` 添加 `Release()` 方法 |
+
+### 实施详情
+
+**缓冲池使用**:
+```go
+// MuxForwarder
+buf := f.bufferPool.Get()
+defer f.bufferPool.Put(buf)
+```
+
+**背压控制使用**:
+```go
+// 检查并让出
+if f.bp.CheckAndYield() {
+    continue
+}
+```
+
+**TCP 优化应用**:
+```go
+// MuxConnManager.AddConnection
+if tcpConn, ok := localConn.(*net.TCPConn); ok {
+    OptimizeTCPConn(tcpConn)
+}
+```
+
+### 后续优化 (P2)
+
+| 项目 | 状态 | 说明 |
+|------|------|------|
+| 批量写入 | 待实施 | 累积消息减少系统调用 |
+| 连接池 | 待实施 | 复用本地连接 |
+| 异步写入 | 待实施 | 避免阻塞 |

@@ -25,6 +25,8 @@
 | [INTEGRATION.md](./INTEGRATION.md) | 集成部署指南 - 6 种场景示例、客户端-服务器架构、监控集成 |
 | [CODE_REVIEW.md](./CODE_REVIEW.md) | 代码审查报告 - 架构评估、设计分析、改进建议 |
 | [docs/MUX_DESIGN.md](./docs/MUX_DESIGN.md) | 多路复用设计 - 共享连接多路转发扩展方案 |
+| [docs/MUX_TUNNEL_DESIGN.md](./docs/MUX_TUNNEL_DESIGN.md) | 多路复用隧道实现 - 客户端-服务器架构详细设计 |
+| [docs/MUX_PROTOCOL_REVIEW.md](./docs/MUX_PROTOCOL_REVIEW.md) | 协议审查报告 - 性能优化分析与实施建议 |
 
 ## 🛠 核心应用场景
 
@@ -939,7 +941,7 @@ func (p *MyProtocol) Forwarder() forward.Forwarder {
 
 ## 多路复用扩展
 
-对于共享连接多路复用场景（如客户端隧道），使用 `forward` 包的扩展接口：
+对于共享连接多路复用场景（如客户端隧道），使用 `forward` 包的扩展接口。已集成缓冲池和背压控制优化。
 
 ### 编码器/解码器
 
@@ -957,12 +959,16 @@ reqMsg, _ := encoder.EncodeRequest("req1", []byte("GET / HTTP/1.1\r\n\r\n"))
 
 // 解码消息
 msgType, id, payload, _ := decoder.Decode(dataMsg)
+
+// 释放缓冲区（优化：缓冲池复用）
+encoder.Release(dataMsg)
 ```
 
 ### 多路转发器
 
 ```go
 // 单向多路转发（本地 -> 远程）
+// 已集成缓冲池和背压控制
 muxForwarder := forward.NewMuxForwarder()
 muxForwarder.ForwardMux(ctx, localConn, muxConn, "conn1", encoder)
 
@@ -975,9 +981,10 @@ biForwarder.ForwardBidirectionalMux(ctx, localConn, muxConn, "conn1", encoder, d
 
 ```go
 // 管理共享连接上的多个虚拟连接
+// 已集成缓冲池、背压控制和 TCP 优化
 mgr := forward.NewMuxConnManager(muxConn, encoder, decoder)
 
-// 添加连接（自动开始转发）
+// 添加连接（自动开始转发，自动应用 TCP 优化）
 mgr.AddConnection("conn1", localConn)
 
 // 处理接收到的消息
@@ -1004,6 +1011,17 @@ resp, _ := httpForwarder.ForwardHTTP(ctx, reqData, muxConn, "req1", encoder, dec
 | `REQUEST` | `REQUEST:<req_id>:<length>:<payload>\n` | HTTP 请求 |
 | `RESPONSE` | `RESPONSE:<req_id>:<length>:<payload>\n` | HTTP 响应 |
 | `NEWCONN` | `NEWCONN:<conn_id>:<remote_addr>\n` | 新连接通知 |
+
+### 性能优化
+
+多路复用模块已集成以下优化：
+
+| 优化项 | 说明 | 效果 |
+|--------|------|------|
+| 缓冲池 | 使用 `internal/pool` 复用缓冲区 | 减少 GC 压力 |
+| 背压控制 | 使用 `internal/backpressure` | 防止内存溢出 |
+| TCP 优化 | 自动应用 `OptimizeTCPConn` | 降低延迟 |
+| 二进制协议 | BinaryProtocol 高效编码 | 减少内存分配 |
     return forward.NewForwarder()
 }
 ```
@@ -1274,6 +1292,17 @@ proxy -protocol http2 -listen :443 -target localhost:8080 \
 - `gopkg.in/yaml.v3` - YAML 配置解析
 
 ## 更新日志
+
+### v1.0.1 (2026-04-15)
+
+**性能优化**
+- 多路复用模块集成缓冲池 (`internal/pool`)，减少 GC 压力
+- 多路复用模块集成背压控制 (`internal/backpressure`)，防止内存溢出
+- MuxConnManager 自动应用 TCP 优化 (`OptimizeTCPConn`)
+- DefaultMuxEncoder 添加 `Release()` 方法支持缓冲区复用
+
+**修复**
+- 修复 `TestManager_CloseIdle` 竞态条件测试不稳定问题
 
 ### v1.0.0 (2026-04-15)
 

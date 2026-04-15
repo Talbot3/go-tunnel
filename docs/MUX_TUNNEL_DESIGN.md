@@ -2175,3 +2175,26 @@ func (c *MuxClient) sendFile(connID string, file *os.File) error {
 | 消息类型 | `MessageType` | 自定义消息类型 (0x20-0x7F) |
 | 认证 | `AuthToken` | 自定义认证逻辑 |
 | TLS | `tls.Config` | 自定义 TLS 配置 |
+
+---
+
+## 十一、实现状态 (2026-04-15)
+
+### forward/mux.go 已实现
+
+`forward/mux.go` 已实现以下组件并集成性能优化：
+
+| 组件 | 状态 | 优化项 |
+|------|------|--------|
+| `BinaryProtocol` | ✅ 已实现 | 缓冲池支持 |
+| `DefaultMuxEncoder` | ✅ 已实现 | Release 方法 |
+| `DefaultMuxDecoder` | ✅ 已实现 | 零拷贝解码 |
+| `MuxForwarder` | ✅ 已实现 | 缓冲池 + 背压控制 |
+| `BidirectionalMuxForwarder` | ✅ 已实现 | 缓冲池 + 背压控制 |
+| `MuxConnManager` | ✅ 已实现 | 缓冲池 + 背压控制 + TCP 优化 |
+| `HTTPMuxForwarder` | ✅ 已实现 | HTTP 请求-响应模式 |
+| `HTTPMuxHandler` | ✅ 已实现 | 服务端 HTTP 处理 |
+
+### 服务端/客户端实现
+
+`MuxServer` 和 `MuxClient` 的完整实现可参考本文档的设计方案，由上层应用根据业务需求实现。

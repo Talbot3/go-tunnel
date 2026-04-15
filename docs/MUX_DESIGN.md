@@ -841,11 +841,24 @@ func main() {
 
 ## 六、实现优先级
 
-| 优先级 | 组件 | 原因 |
+| 优先级 | 组件 | 原因 | 状态 |
+|--------|------|------|------|
+| P0 | MuxEncoder/Decoder | 基础组件 | ✅ 已完成 |
+| P0 | MuxForwarder | 客户端 TCP 核心 | ✅ 已完成 |
+| P1 | MuxConnManager | 简化使用 | ✅ 已完成 |
+| P1 | BidirectionalMuxForwarder | 完整双向支持 | ✅ 已完成 |
+| P2 | HTTPMuxForwarder | HTTP 隧道支持 | ✅ 已完成 |
+| P2 | HTTPMuxHandler | 服务端 HTTP | ✅ 已完成 |
+
+---
+
+## 七、性能优化实施状态 (2026-04-15)
+
+所有 P0 优化项已实施完成：
+
+| 优化项 | 说明 | 状态 |
 |--------|------|------|
-| P0 | MuxEncoder/Decoder | 基础组件 |
-| P0 | MuxForwarder | 客户端 TCP 核心 |
-| P1 | MuxConnManager | 简化使用 |
-| P1 | BidirectionalMuxForwarder | 完整双向支持 |
-| P2 | HTTPMuxForwarder | HTTP 隧道支持 |
-| P2 | HTTPMuxHandler | 服务端 HTTP |
+| 缓冲池 | 使用 `internal/pool` 复用缓冲区 | ✅ 已完成 |
+| 背压控制 | 使用 `internal/backpressure` | ✅ 已完成 |
+| TCP 优化 | 自动应用 `OptimizeTCPConn` | ✅ 已完成 |
+| Release 方法 | 支持缓冲区复用 | ✅ 已完成 |
