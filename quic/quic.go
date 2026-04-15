@@ -799,6 +799,7 @@ type MuxClient struct {
 
 	// QUIC connection
 	conn quic.Connection
+	connMu sync.RWMutex // Protects conn access
 
 	// Control stream
 	controlStream quic.Stream
@@ -867,9 +868,12 @@ func (s *MuxClient) Stop() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
+
+	s.connMu.Lock()
 	if s.conn != nil {
 		s.conn.CloseWithError(0, "client stopped")
 	}
+	s.connMu.Unlock()
 
 	// Close local connections
 	s.localConns.Range(func(key, value interface{}) bool {
@@ -951,7 +955,9 @@ func (s *MuxClient) connect() error {
 		udpConn.Close()
 		return fmt.Errorf("dial QUIC failed: %w", err)
 	}
+	s.connMu.Lock()
 	s.conn = conn
+	s.connMu.Unlock()
 
 	// 4. Open control stream
 	controlStream, err := conn.OpenStreamSync(s.ctx)
