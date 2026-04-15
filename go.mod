@@ -5,6 +5,7 @@ go 1.24.0
 require (
 	github.com/caddyserver/certmagic v0.25.2
 	github.com/libdns/libdns v1.1.1
+	github.com/prometheus/client_golang v1.23.2
 	github.com/quic-go/quic-go v0.42.0
 	golang.org/x/net v0.50.0
 	golang.org/x/sys v0.41.0
@@ -18,12 +19,10 @@ require (
 	github.com/go-task/slim-sprig v0.0.0-20230315185526-52ccab3ef572 // indirect
 	github.com/google/pprof v0.0.0-20210407192527-94a9f03dee38 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
-	github.com/kr/pretty v0.3.1 // indirect
 	github.com/mholt/acmez/v3 v3.1.6 // indirect
 	github.com/miekg/dns v1.1.72 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/onsi/ginkgo/v2 v2.9.5 // indirect
-	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect

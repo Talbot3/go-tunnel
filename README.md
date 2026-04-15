@@ -22,8 +22,9 @@
 
 | 文档 | 说明 |
 |------|------|
-| [INTEGRATION.md](./INTEGRATION.md) | 集成部署指南 - 5 种场景示例、监控集成、部署检查清单 |
+| [INTEGRATION.md](./INTEGRATION.md) | 集成部署指南 - 6 种场景示例、客户端-服务器架构、监控集成 |
 | [CODE_REVIEW.md](./CODE_REVIEW.md) | 代码审查报告 - 架构评估、设计分析、改进建议 |
+| [docs/MUX_DESIGN.md](./docs/MUX_DESIGN.md) | 多路复用设计 - 共享连接多路转发扩展方案 |
 
 ## 🛠 核心应用场景
 
@@ -932,6 +933,77 @@ func (p *MyProtocol) Dial(ctx context.Context, addr string) (net.Conn, error) {
 }
 
 func (p *MyProtocol) Forwarder() forward.Forwarder {
+    return forward.NewForwarder()
+}
+```
+
+## 多路复用扩展
+
+对于共享连接多路复用场景（如客户端隧道），使用 `forward` 包的扩展接口：
+
+### 编码器/解码器
+
+```go
+import "github.com/Talbot3/go-tunnel/forward"
+
+// 创建编码器和解码器
+encoder := forward.NewDefaultMuxEncoder()
+decoder := forward.NewDefaultMuxDecoder()
+
+// 编码消息
+dataMsg, _ := encoder.EncodeData("conn1", []byte("hello"))
+closeMsg, _ := encoder.EncodeClose("conn1")
+reqMsg, _ := encoder.EncodeRequest("req1", []byte("GET / HTTP/1.1\r\n\r\n"))
+
+// 解码消息
+msgType, id, payload, _ := decoder.Decode(dataMsg)
+```
+
+### 多路转发器
+
+```go
+// 单向多路转发（本地 -> 远程）
+muxForwarder := forward.NewMuxForwarder()
+muxForwarder.ForwardMux(ctx, localConn, muxConn, "conn1", encoder)
+
+// 双向多路转发
+biForwarder := forward.NewBidirectionalMuxForwarder()
+biForwarder.ForwardBidirectionalMux(ctx, localConn, muxConn, "conn1", encoder, decoder)
+```
+
+### 连接管理器
+
+```go
+// 管理共享连接上的多个虚拟连接
+mgr := forward.NewMuxConnManager(muxConn, encoder, decoder)
+
+// 添加连接（自动开始转发）
+mgr.AddConnection("conn1", localConn)
+
+// 处理接收到的消息
+mgr.HandleIncoming(data)
+
+// 获取统计信息
+stats := mgr.Stats()
+```
+
+### HTTP 多路转发
+
+```go
+// HTTP 请求-响应模式
+httpForwarder := forward.NewHTTPMuxForwarder()
+resp, _ := httpForwarder.ForwardHTTP(ctx, reqData, muxConn, "req1", encoder, decoder, 30*time.Second)
+```
+
+### 消息类型
+
+| 类型 | 格式 | 说明 |
+|------|------|------|
+| `DATA` | `DATA:<conn_id>:<length>:<payload>\n` | TCP 数据 |
+| `CLOSE` | `CLOSE:<conn_id>\n` | 连接关闭 |
+| `REQUEST` | `REQUEST:<req_id>:<length>:<payload>\n` | HTTP 请求 |
+| `RESPONSE` | `RESPONSE:<req_id>:<length>:<payload>\n` | HTTP 响应 |
+| `NEWCONN` | `NEWCONN:<conn_id>:<remote_addr>\n` | 新连接通知 |
     return forward.NewForwarder()
 }
 ```
