@@ -213,8 +213,11 @@ func TestManager_CloseIdle(t *testing.T) {
 		t.Error("expected nil for zero timeout")
 	}
 
-	// Very short timeout - should not close recent connection
-	closed = m.CloseIdle(time.Nanosecond)
+	// Short timeout - should not close recent connection
+	// Use millisecond instead of nanosecond to avoid race condition
+	// where the time between connection creation and CloseIdle call
+	// exceeds the timeout
+	closed = m.CloseIdle(time.Millisecond)
 	if len(closed) != 0 {
 		t.Errorf("expected 0 closed, got %d", len(closed))
 	}
