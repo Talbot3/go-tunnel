@@ -4,6 +4,14 @@
 // using TLS 1.3. QUIC offers improved performance over TCP with reduced
 // connection establishment latency and better congestion control.
 //
+// # Limitations
+//
+// The current implementation uses a single QUIC stream per connection.
+// While QUIC supports multiplexing multiple streams over a single connection,
+// this package uses one stream to maintain net.Conn interface compatibility.
+// For most tunnel use cases, this provides excellent performance.
+// Future versions may add multi-stream support for advanced scenarios.
+//
 // # Example
 //
 //	cfg := &tls.Config{

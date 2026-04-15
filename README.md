@@ -330,6 +330,8 @@ tlsConfig := &tls.Config{
 p := quic.New(tlsConfig, quic.DefaultConfig())
 ```
 
+> **注意**: 当前 QUIC 实现使用单流模式（每个连接一个 QUIC stream）。这保持了与 `net.Conn` 接口的兼容性，对于大多数隧道场景性能足够。未来版本可能添加多流支持。
+
 ## 自动 TLS 证书管理
 
 go-tunnel 集成了 certmagic 库，支持基于 ACME 协议自动申请和续期 TLS 证书。

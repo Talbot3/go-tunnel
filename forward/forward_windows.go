@@ -12,6 +12,13 @@ import (
 	"github.com/Talbot3/go-tunnel/internal/pool"
 )
 
+// Windows socket option constants not defined in syscall package.
+const (
+	// TCP_FASTOPEN enables TCP Fast Open (Windows 10+).
+	// This allows data to be sent in the SYN packet.
+	TCP_FASTOPEN = 23
+)
+
 // platformForwarder implements optimized forwarding for Windows.
 // Windows uses IOCP (I/O Completion Ports) underneath Go's net package.
 type platformForwarder struct{}
@@ -52,7 +59,7 @@ func applyWindowsTCPOptions(tc *net.TCPConn) {
 
 		// Enable TCP_FASTOPEN if available (Windows 10+)
 		// This allows data to be sent in the SYN packet
-		syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_TCP, 23, 1) // TCP_FASTOPEN = 23
+		syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_TCP, TCP_FASTOPEN, 1)
 
 		// Set SO_REUSEADDR for faster port reuse
 		syscall.SetsockoptInt(syscall.Handle(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)

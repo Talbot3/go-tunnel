@@ -257,6 +257,15 @@ func (s *Stats) Uptime() time.Duration {
 	return time.Since(s.startTime)
 }
 
+// Reset resets all statistics to zero and updates the start time.
+func (s *Stats) Reset() {
+	s.connections.Store(0)
+	s.bytesSent.Store(0)
+	s.bytesRecv.Store(0)
+	s.errors.Store(0)
+	s.startTime = time.Now()
+}
+
 // New creates a new Tunnel with the given configuration.
 // The tunnel is not started until Start() is called.
 //
@@ -376,11 +385,21 @@ func (t *Tunnel) acceptLoop(ctx context.Context) {
 }
 
 func (t *Tunnel) handleConnection(ctx context.Context, src net.Conn) {
+	// Set connection deadline if configured
+	if t.config.ConnectionTimeout > 0 {
+		src.SetDeadline(time.Now().Add(t.config.ConnectionTimeout))
+	}
+
 	dst, err := t.protocol.Dial(ctx, t.config.TargetAddr)
 	if err != nil {
 		src.Close()
 		t.stats.errors.Add(1)
 		return
+	}
+
+	// Set deadline on destination connection too
+	if t.config.ConnectionTimeout > 0 {
+		dst.SetDeadline(time.Now().Add(t.config.ConnectionTimeout))
 	}
 
 	fwd := t.protocol.Forwarder()
