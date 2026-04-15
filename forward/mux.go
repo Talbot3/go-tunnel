@@ -300,33 +300,33 @@ var (
 
 // DefaultMuxEncoder implements MuxEncoder with a text-based protocol.
 // Optimized with buffer pool and avoiding fmt.Sprintf allocations.
+// Thread-safe for concurrent use.
 type DefaultMuxEncoder struct {
 	Delimiter byte
-	buf       []byte // Pre-allocated buffer for encoding
-	bufPool   *pool.BufferPool
+	bufPool   *sync.Pool
 }
 
 // NewDefaultMuxEncoder creates a new default mux encoder.
 func NewDefaultMuxEncoder() *DefaultMuxEncoder {
 	return &DefaultMuxEncoder{
 		Delimiter: '\n',
-		buf:       make([]byte, 64*1024), // Pre-allocate 64KB buffer
-		bufPool:   pool.NewBufferPool(64 * 1024),
+		bufPool: &sync.Pool{
+			New: func() any {
+				buf := make([]byte, 64*1024)
+				return &buf
+			},
+		},
 	}
 }
 
-// getBuffer returns a buffer with at least 'size' capacity
-func (e *DefaultMuxEncoder) getBuffer(size int) []byte {
-	if size <= cap(e.buf) {
-		return e.buf[:cap(e.buf)]
-	}
-	// For larger payloads, get from pool
-	b := e.bufPool.Get()
-	if cap(*b) < size {
-		e.bufPool.Put(b)
-		*b = make([]byte, size)
-	}
-	return *b
+// getBuffer returns a buffer from the pool
+func (e *DefaultMuxEncoder) getBuffer() []byte {
+	return *e.bufPool.Get().(*[]byte)
+}
+
+// putBuffer returns a buffer to the pool
+func (e *DefaultMuxEncoder) putBuffer(buf []byte) {
+	e.bufPool.Put(&buf)
 }
 
 // writeInt writes an integer to buffer without allocations
@@ -361,7 +361,11 @@ func (e *DefaultMuxEncoder) EncodeData(connID string, data []byte) ([]byte, erro
 	// Estimate max header length: "DATA:" + connID + ":" + max 10 digits + ":" = 5 + len + 1 + 10 + 1
 	maxTotalLen := 5 + connIDLen + 1 + 10 + 1 + dataLen + 1
 
-	buf := e.getBuffer(maxTotalLen)
+	buf := e.getBuffer()
+	if cap(buf) < maxTotalLen {
+		e.putBuffer(buf)
+		buf = make([]byte, maxTotalLen)
+	}
 
 	offset := 0
 
@@ -395,21 +399,25 @@ func (e *DefaultMuxEncoder) EncodeData(connID string, data []byte) ([]byte, erro
 	// Return a copy
 	result := make([]byte, offset)
 	copy(result, buf[:offset])
+	e.putBuffer(buf)
 	return result, nil
 }
 
 // EncodeClose encodes a close message.
 func (e *DefaultMuxEncoder) EncodeClose(connID string) ([]byte, error) {
+	buf := e.getBuffer()
+
 	offset := 0
-	copy(e.buf[offset:], "CLOSE:")
+	copy(buf[offset:], "CLOSE:")
 	offset += 6
-	copy(e.buf[offset:], connID)
+	copy(buf[offset:], connID)
 	offset += len(connID)
-	e.buf[offset] = e.Delimiter
+	buf[offset] = e.Delimiter
 	offset++
 
 	result := make([]byte, offset)
-	copy(result, e.buf[:offset])
+	copy(result, buf[:offset])
+	e.putBuffer(buf)
 	return result, nil
 }
 
@@ -418,7 +426,11 @@ func (e *DefaultMuxEncoder) EncodeRequest(reqID string, data []byte) ([]byte, er
 	dataLen := len(data)
 	maxTotalLen := 8 + len(reqID) + 1 + 10 + 1 + dataLen + 1
 
-	buf := e.getBuffer(maxTotalLen)
+	buf := e.getBuffer()
+	if cap(buf) < maxTotalLen {
+		e.putBuffer(buf)
+		buf = make([]byte, maxTotalLen)
+	}
 
 	offset := 0
 	copy(buf[offset:], "REQUEST:")
@@ -437,6 +449,7 @@ func (e *DefaultMuxEncoder) EncodeRequest(reqID string, data []byte) ([]byte, er
 
 	result := make([]byte, offset)
 	copy(result, buf[:offset])
+	e.putBuffer(buf)
 	return result, nil
 }
 
@@ -445,7 +458,11 @@ func (e *DefaultMuxEncoder) EncodeResponse(reqID string, data []byte) ([]byte, e
 	dataLen := len(data)
 	maxTotalLen := 9 + len(reqID) + 1 + 10 + 1 + dataLen + 1
 
-	buf := e.getBuffer(maxTotalLen)
+	buf := e.getBuffer()
+	if cap(buf) < maxTotalLen {
+		e.putBuffer(buf)
+		buf = make([]byte, maxTotalLen)
+	}
 
 	offset := 0
 	copy(buf[offset:], "RESPONSE:")
@@ -464,30 +481,34 @@ func (e *DefaultMuxEncoder) EncodeResponse(reqID string, data []byte) ([]byte, e
 
 	result := make([]byte, offset)
 	copy(result, buf[:offset])
+	e.putBuffer(buf)
 	return result, nil
 }
 
 // EncodeNewConn encodes a new connection notification.
 func (e *DefaultMuxEncoder) EncodeNewConn(connID, remoteAddr string) ([]byte, error) {
+	buf := e.getBuffer()
+
 	offset := 0
-	copy(e.buf[offset:], "NEWCONN:")
+	copy(buf[offset:], "NEWCONN:")
 	offset += 8
-	copy(e.buf[offset:], connID)
+	copy(buf[offset:], connID)
 	offset += len(connID)
-	e.buf[offset] = ':'
+	buf[offset] = ':'
 	offset++
-	copy(e.buf[offset:], remoteAddr)
+	copy(buf[offset:], remoteAddr)
 	offset += len(remoteAddr)
-	e.buf[offset] = e.Delimiter
+	buf[offset] = e.Delimiter
 	offset++
 
 	result := make([]byte, offset)
-	copy(result, e.buf[:offset])
+	copy(result, buf[:offset])
+	e.putBuffer(buf)
 	return result, nil
 }
 
 // Release releases the encoded buffer back to pool.
-// For this implementation, it's a no-op since we use a shared buffer.
+// For this implementation, it's a no-op since we return copies.
 func (e *DefaultMuxEncoder) Release(buf []byte) {}
 
 // DefaultMuxDecoder implements MuxDecoder for the text-based protocol.

@@ -3,6 +3,7 @@ package forward
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -548,4 +549,232 @@ func BenchmarkBinaryProtocol_Encode_ZeroAlloc(b *testing.B) {
 		encoded, _ := p.Encode(msg)
 		p.Release(encoded)
 	}
+}
+
+// ============================================
+// Stress Tests for DefaultMuxEncoder
+// ============================================
+
+func TestDefaultMuxEncoder_ConcurrentStress(t *testing.T) {
+	encoder := NewDefaultMuxEncoder()
+	decoder := NewDefaultMuxDecoder()
+
+	const (
+		goroutines = 100
+		iterations = 10000
+		dataSize   = 1024
+	)
+
+	data := make([]byte, dataSize)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	start := time.Now()
+
+	for g := 0; g < goroutines; g++ {
+		go func(id int) {
+			defer wg.Done()
+			connID := fmt.Sprintf("conn%d", id)
+
+			for i := 0; i < iterations; i++ {
+				// Encode
+				encoded, err := encoder.EncodeData(connID, data)
+				if err != nil {
+					t.Errorf("encode failed: %v", err)
+					return
+				}
+
+				// Decode
+				msgType, id2, payload, err := decoder.Decode(encoded)
+				if err != nil {
+					t.Errorf("decode failed: %v", err)
+					return
+				}
+
+				if msgType != MsgTypeData {
+					t.Errorf("expected DATA, got %v", msgType)
+					return
+				}
+
+				if id2 != connID {
+					t.Errorf("expected connID %s, got %s", connID, id2)
+					return
+				}
+
+				if len(payload) != dataSize {
+					t.Errorf("expected payload size %d, got %d", dataSize, len(payload))
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	elapsed := time.Since(start)
+	totalOps := goroutines * iterations * 2 // encode + decode
+	opsPerSec := float64(totalOps) / elapsed.Seconds()
+
+	t.Logf("Concurrent stress test: %d goroutines x %d iterations", goroutines, iterations)
+	t.Logf("Total operations: %d (encode + decode)", totalOps)
+	t.Logf("Duration: %v", elapsed)
+	t.Logf("Throughput: %.2f ops/sec", opsPerSec)
+	t.Logf("Latency: %v per op", elapsed/time.Duration(totalOps))
+}
+
+func TestDefaultMuxEncoder_Throughput(t *testing.T) {
+	encoder := NewDefaultMuxEncoder()
+
+	const (
+		totalMessages = 1000000
+		dataSize      = 1024
+	)
+
+	data := make([]byte, dataSize)
+	connID := "conn1"
+
+	start := time.Now()
+
+	for i := 0; i < totalMessages; i++ {
+		encoded, _ := encoder.EncodeData(connID, data)
+		encoder.Release(encoded)
+	}
+
+	elapsed := time.Since(start)
+	msgsPerSec := float64(totalMessages) / elapsed.Seconds()
+	mbPerSec := msgsPerSec * float64(dataSize) / 1024 / 1024
+
+	t.Logf("Throughput test: %d messages", totalMessages)
+	t.Logf("Duration: %v", elapsed)
+	t.Logf("Messages/sec: %.2f", msgsPerSec)
+	t.Logf("Throughput: %.2f MB/sec", mbPerSec)
+}
+
+func TestDefaultMuxEncoder_MixedOperations(t *testing.T) {
+	encoder := NewDefaultMuxEncoder()
+	decoder := NewDefaultMuxDecoder()
+
+	const iterations = 100000
+
+	data := make([]byte, 512)
+	start := time.Now()
+
+	for i := 0; i < iterations; i++ {
+		connID := fmt.Sprintf("conn%d", i%100)
+
+		switch i % 5 {
+		case 0:
+			// DATA
+			encoded, _ := encoder.EncodeData(connID, data)
+			decoder.Decode(encoded)
+		case 1:
+			// CLOSE
+			encoded, _ := encoder.EncodeClose(connID)
+			decoder.Decode(encoded)
+		case 2:
+			// REQUEST
+			encoded, _ := encoder.EncodeRequest(connID, data)
+			decoder.Decode(encoded)
+		case 3:
+			// RESPONSE
+			encoded, _ := encoder.EncodeResponse(connID, data)
+			decoder.Decode(encoded)
+		case 4:
+			// NEWCONN
+			encoded, _ := encoder.EncodeNewConn(connID, "192.168.1.1:12345")
+			decoder.Decode(encoded)
+		}
+	}
+
+	elapsed := time.Since(start)
+	opsPerSec := float64(iterations*2) / elapsed.Seconds()
+
+	t.Logf("Mixed operations test: %d iterations", iterations)
+	t.Logf("Duration: %v", elapsed)
+	t.Logf("Ops/sec: %.2f", opsPerSec)
+}
+
+func TestDefaultMuxEncoder_VaryingPayloadSizes(t *testing.T) {
+	encoder := NewDefaultMuxEncoder()
+	decoder := NewDefaultMuxDecoder()
+
+	sizes := []int{64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536}
+	const iterationsPerSize = 10000
+
+	for _, size := range sizes {
+		data := make([]byte, size)
+		start := time.Now()
+
+		for i := 0; i < iterationsPerSize; i++ {
+			encoded, _ := encoder.EncodeData("conn1", data)
+			decoder.Decode(encoded)
+		}
+
+		elapsed := time.Since(start)
+		opsPerSec := float64(iterationsPerSize*2) / elapsed.Seconds()
+		mbPerSec := opsPerSec * float64(size) / 1024 / 1024 / 2
+
+		t.Logf("Size %6d bytes: %8.2f ops/sec, %6.2f MB/sec", size, opsPerSec, mbPerSec)
+	}
+}
+
+// Benchmark with different payload sizes
+func BenchmarkDefaultMuxEncoder_SmallPayload(b *testing.B) {
+	encoder := NewDefaultMuxEncoder()
+	data := make([]byte, 64)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		encoder.EncodeData("conn1", data)
+	}
+}
+
+func BenchmarkDefaultMuxEncoder_MediumPayload(b *testing.B) {
+	encoder := NewDefaultMuxEncoder()
+	data := make([]byte, 4096)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		encoder.EncodeData("conn1", data)
+	}
+}
+
+func BenchmarkDefaultMuxEncoder_LargePayload(b *testing.B) {
+	encoder := NewDefaultMuxEncoder()
+	data := make([]byte, 65536)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		encoder.EncodeData("conn1", data)
+	}
+}
+
+func BenchmarkDefaultMuxEncoder_Parallel(b *testing.B) {
+	encoder := NewDefaultMuxEncoder()
+	data := make([]byte, 1024)
+
+	b.RunParallel(func(pb *testing.PB) {
+		connID := "conn1"
+		for pb.Next() {
+			encoder.EncodeData(connID, data)
+		}
+	})
+}
+
+func BenchmarkDefaultMuxEncoder_EncodeDecode_Parallel(b *testing.B) {
+	encoder := NewDefaultMuxEncoder()
+	decoder := NewDefaultMuxDecoder()
+	data := make([]byte, 1024)
+
+	b.RunParallel(func(pb *testing.PB) {
+		connID := "conn1"
+		for pb.Next() {
+			encoded, _ := encoder.EncodeData(connID, data)
+			decoder.Decode(encoded)
+		}
+	})
 }
