@@ -217,26 +217,36 @@ func (p *ConnPool) GetStats() Stats {
 
 // createConn creates a new connection with timeout.
 func (p *ConnPool) createConn(ctx context.Context) (net.Conn, error) {
-	done := make(chan struct{})
-	var conn net.Conn
-	var err error
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	done := make(chan result, 1)
 
 	go func() {
-		conn, err = p.factory()
-		close(done)
+		conn, err := p.factory()
+		done <- result{conn, err}
 	}()
 
 	select {
-	case <-done:
-		if err != nil {
-			return nil, err
+	case r := <-done:
+		if r.err != nil {
+			return nil, r.err
 		}
 		return &pooledConn{
-			Conn:      conn,
+			Conn:      r.conn,
 			createdAt: time.Now(),
 			pool:      p,
 		}, nil
 	case <-ctx.Done():
+		// The factory goroutine will still complete, but we need to handle
+		// the connection if it was created successfully
+		go func() {
+			r := <-done
+			if r.conn != nil {
+				r.conn.Close()
+			}
+		}()
 		return nil, ctx.Err()
 	}
 }

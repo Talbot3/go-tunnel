@@ -54,11 +54,9 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/Talbot3/go-tunnel/forward"
@@ -482,21 +480,9 @@ func (t *Tunnel) handleConnection(ctx context.Context, src net.Conn) {
 
 // IsClosedErr returns true if the error indicates a normal connection close.
 // This includes EOF, connection reset, and use of closed network connection.
+// This function delegates to forward.IsClosedErr for consistent error handling.
 func IsClosedErr(err error) bool {
-	if err == nil {
-		return true
-	}
-	if err == io.EOF {
-		return true
-	}
-	if opErr, ok := err.(*net.OpError); ok {
-		return opErr.Err.Error() == "use of closed network connection"
-	}
-	switch err {
-	case syscall.EPIPE, syscall.ECONNRESET, syscall.ECONNABORTED:
-		return true
-	}
-	return false
+	return forward.IsClosedErr(err)
 }
 
 // Forward performs bidirectional forwarding between two connections.

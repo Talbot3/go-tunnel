@@ -321,14 +321,14 @@ func (s *MuxServer) handleConnection(conn quic.Connection) {
 	}
 
 	// Read stream type
-	streamType := make([]byte, 1)
-	if _, err := io.ReadFull(stream, streamType); err != nil {
+	var streamTypeBuf [1]byte
+	if _, err := io.ReadFull(stream, streamTypeBuf[:]); err != nil {
 		stream.Close()
 		return
 	}
 
-	if streamType[0] != StreamTypeControl {
-		log.Printf("[MuxServer] Expected control stream, got type %d", streamType[0])
+	if streamTypeBuf[0] != StreamTypeControl {
+		log.Printf("[MuxServer] Expected control stream, got type %d", streamTypeBuf[0])
 		stream.Close()
 		return
 	}
@@ -512,22 +512,23 @@ func (s *MuxServer) handleDataStream(tunnel *Tunnel, stream quic.Stream) {
 	defer stream.Close()
 
 	// Read stream type
-	streamType := make([]byte, 1)
-	if _, err := io.ReadFull(stream, streamType); err != nil {
+	var streamTypeBuf [1]byte
+	if _, err := io.ReadFull(stream, streamTypeBuf[:]); err != nil {
 		return
 	}
 
-	if streamType[0] != StreamTypeData {
+	if streamTypeBuf[0] != StreamTypeData {
 		return
 	}
 
-	// Read connID
-	connIDLen := make([]byte, 2)
-	if _, err := io.ReadFull(stream, connIDLen); err != nil {
+	// Read connID length
+	var connIDLenBuf [2]byte
+	if _, err := io.ReadFull(stream, connIDLenBuf[:]); err != nil {
 		return
 	}
 
-	connID := make([]byte, binary.BigEndian.Uint16(connIDLen))
+	connIDLen := binary.BigEndian.Uint16(connIDLenBuf[:])
+	connID := make([]byte, connIDLen)
 	if _, err := io.ReadFull(stream, connID); err != nil {
 		return
 	}
@@ -591,7 +592,9 @@ func (s *MuxServer) handleExternalConnection(tunnel *Tunnel, extConn net.Conn) {
 
 	// Send NEWCONN to client
 	msg := buildNewConnMessage(connID, extConn.RemoteAddr().String())
-	tunnel.ControlStream.Write(msg)
+	if _, writeErr := tunnel.ControlStream.Write(msg); writeErr != nil {
+		log.Printf("[MuxServer] Write NEWCONN failed: %v", writeErr)
+	}
 
 	log.Printf("[MuxServer] New connection: %s -> %s", connID, extConn.RemoteAddr().String())
 
@@ -609,7 +612,9 @@ func (s *MuxServer) forwardExternalToControl(tunnel *Tunnel, extConn net.Conn, c
 
 		// Send close message
 		closeMsg := buildCloseConnMessage(connID)
-		tunnel.ControlStream.Write(closeMsg)
+		if _, writeErr := tunnel.ControlStream.Write(closeMsg); writeErr != nil {
+			log.Printf("[MuxServer] Write CLOSE failed: %v", writeErr)
+		}
 	}()
 
 	buf := s.bufferPool.Get()
@@ -630,8 +635,15 @@ func (s *MuxServer) forwardExternalToControl(tunnel *Tunnel, extConn net.Conn, c
 		}
 
 		// Encode and send
-		encoded, _ := encoder.EncodeData(connID, (*buf)[:n])
-		tunnel.ControlStream.Write(encoded)
+		encoded, err := encoder.EncodeData(connID, (*buf)[:n])
+		if err != nil {
+			log.Printf("[MuxServer] EncodeData error: %v", err)
+			return
+		}
+		if _, writeErr := tunnel.ControlStream.Write(encoded); writeErr != nil {
+			encoder.Release(encoded)
+			return
+		}
 		encoder.Release(encoded)
 
 		s.bytesOut.Add(int64(n))
@@ -653,8 +665,9 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 	buf := s.bufferPool.Get()
 	defer s.bufferPool.Put(buf)
 
-	// Use a single done channel - when either direction exits, cancel the other
-	done := make(chan struct{}, 1)
+	// Use a done channel with buffer size 2 to avoid blocking
+	// when both goroutines try to send after context cancellation
+	done := make(chan struct{}, 2)
 
 	// External -> Stream
 	go func() {
@@ -1013,7 +1026,12 @@ func (s *MuxClient) connect() error {
 	conn, err := quic.Dial(s.ctx, udpConn, udpAddr, tlsConf, s.config.QUICConfig)
 	if err != nil {
 		udpConn.Close()
-		return fmt.Errorf("dial QUIC failed: %w", err)
+		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		default:
+			return fmt.Errorf("dial QUIC failed: %w", err)
+		}
 	}
 	s.connMu.Lock()
 	s.conn = conn
@@ -1297,8 +1315,15 @@ func (s *MuxClient) forwardLocalToControl(localConn net.Conn, connID string) {
 		}
 
 		// Encode and send
-		encoded, _ := encoder.EncodeData(connID, (*buf)[:n])
-		s.controlStream.Write(encoded)
+		encoded, err := encoder.EncodeData(connID, (*buf)[:n])
+		if err != nil {
+			log.Printf("[MuxClient] EncodeData error: %v", err)
+			return
+		}
+		if _, writeErr := s.controlStream.Write(encoded); writeErr != nil {
+			encoder.Release(encoded)
+			return
+		}
 		encoder.Release(encoded)
 
 		s.bytesOut.Add(int64(n))
