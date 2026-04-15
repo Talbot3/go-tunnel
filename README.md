@@ -1,6 +1,8 @@
 # go-tunnel: 企业级云原生多协议转发引擎
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/Talbot3/go-tunnel.svg)](https://pkg.go.dev/github.com/Talbot3/go-tunnel)
+[![Go Report Card](https://goreportcard.com/badge/github.com/Talbot3/go-tunnel)](https://goreportcard.com/report/github.com/Talbot3/go-tunnel)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **go-tunnel** 是一个专为高并发、低延迟场景设计的跨平台高性能转发库。它不仅对标 **Nginx/Envoy** 的转发核心，更针对 **Go 运行时** 进行了极致的底层优化。通过解耦协议层与传输层，`go-tunnel` 实现了在单一架构下对 **TCP、HTTP/2、HTTP/3 (QUIC)** 的统一调度与平滑切换。
 
@@ -153,6 +155,7 @@ func (s *Stats) BytesSent() int64       // 发送字节数
 func (s *Stats) BytesReceived() int64   // 接收字节数
 func (s *Stats) Errors() int64          // 错误数
 func (s *Stats) Uptime() time.Duration  // 运行时间
+func (s *Stats) Reset()                 // 重置统计信息
 ```
 
 #### `type Protocol`
@@ -623,14 +626,27 @@ go-tunnel/
 | 延迟 | 0.068ms | 0.170ms | 增加 0.102ms |
 | 并发 RPS | 10,455 | 7,585 | 损失 27.5% |
 
+### 测试覆盖率
+
+| 包 | 覆盖率 |
+|----|--------|
+| tunnel | 70.6% |
+| forward | 47.5% |
+| internal/backpressure | 98.6% |
+| internal/connmgr | 91.9% |
+| internal/pool | 86.2% |
+
 ### 运行测试
 
 ```bash
-# 端到端测试
-./test_e2e.sh
+# 运行所有测试
+go test ./... -v
 
-# 性能测试
-./benchmark.sh
+# 运行测试并查看覆盖率
+go test ./... -cover
+
+# 运行性能测试
+go test -bench=. ./...
 ```
 
 ## 扩展协议
@@ -922,6 +938,27 @@ proxy -protocol http2 -listen :443 -target localhost:8080 \
 - `github.com/quic-go/quic-go` - QUIC/HTTP/3 支持
 - `github.com/caddyserver/certmagic` - 自动 TLS 证书管理
 - `gopkg.in/yaml.v3` - YAML 配置解析
+
+## 更新日志
+
+### v1.0.0 (2026-04-15)
+
+**新功能**
+- 完整的 HTTP/3 实现，支持 QUIC 连接接受
+- 添加 `Stats.Reset()` 方法支持重置统计信息
+- 添加连接超时配置支持，防止连接泄漏
+
+**改进**
+- 定义 Windows `TCP_FASTOPEN` 常量，替换魔数
+- 添加 QUIC 单流限制文档说明
+- 添加 `.gitignore` 文件
+
+**测试**
+- 添加 tunnel 包集成测试（覆盖率 70.6%）
+- 添加 forward 包测试（覆盖率 47.5%）
+- 添加 backpressure 包测试（覆盖率 98.6%）
+- 添加 connmgr 包测试（覆盖率 91.9%）
+- 添加 pool 包测试（覆盖率 86.2%）
 
 ## License
 
