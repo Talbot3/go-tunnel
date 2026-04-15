@@ -614,7 +614,10 @@ func (s *MuxServer) forwardExternalToControl(tunnel *Tunnel, extConn net.Conn, c
 
 // forwardBidirectional forwards data bidirectionally
 func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, connID string, tunnel *Tunnel) {
+	ctx, cancel := context.WithCancel(tunnel.ctx)
+
 	defer func() {
+		cancel() // Signal both goroutines to stop
 		extConn.Close()
 		stream.Close()
 		tunnel.ExternalConns.Delete(connID)
@@ -624,9 +627,20 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 	buf := s.bufferPool.Get()
 	defer s.bufferPool.Put(buf)
 
+	// Wait for both directions to complete
+	done := make(chan struct{}, 2)
+
 	// External -> Stream
 	go func() {
+		defer func() {
+			done <- struct{}{}
+		}()
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			n, err := extConn.Read(*buf)
 			if err != nil {
 				return
@@ -637,14 +651,28 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 	}()
 
 	// Stream -> External
-	for {
-		n, err := stream.Read(*buf)
-		if err != nil {
-			return
+	go func() {
+		defer func() {
+			done <- struct{}{}
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			n, err := stream.Read(*buf)
+			if err != nil {
+				return
+			}
+			extConn.Write((*buf)[:n])
+			s.bytesIn.Add(int64(n))
 		}
-		extConn.Write((*buf)[:n])
-		s.bytesIn.Add(int64(n))
-	}
+	}()
+
+	// Wait for both directions to complete
+	<-done
+	<-done
 }
 
 // closeTunnel closes a tunnel
@@ -1353,22 +1381,49 @@ func parseRegisterPayload(payload []byte) (tunnelID string, protocol byte, local
 	// Format: [tunnel_id_len:2][tunnel_id][protocol:1][local_addr_len:2][local_addr][auth_token_len:2][auth_token]
 	offset := 0
 
-	tunnelIDLen := binary.BigEndian.Uint16(payload[offset:])
-	offset += 2
-	tunnelID = string(payload[offset : offset+int(tunnelIDLen)])
-	offset += int(tunnelIDLen)
+	// Validate minimum length: 2 (tunnelIDLen) + 1 (protocol) + 2 (localAddrLen) + 2 (authTokenLen) = 7
+	if len(payload) < 7 {
+		return "", 0, "", "", errors.New("payload too short: minimum 7 bytes required")
+	}
 
+	// Read tunnel ID
+	tunnelIDLen := int(binary.BigEndian.Uint16(payload[offset:]))
+	offset += 2
+	if offset+tunnelIDLen > len(payload) {
+		return "", 0, "", "", fmt.Errorf("invalid tunnel_id length: %d (remaining: %d)", tunnelIDLen, len(payload)-offset)
+	}
+	tunnelID = string(payload[offset : offset+tunnelIDLen])
+	offset += tunnelIDLen
+
+	// Read protocol
+	if offset >= len(payload) {
+		return "", 0, "", "", errors.New("payload truncated: missing protocol byte")
+	}
 	protocol = payload[offset]
 	offset++
 
-	localAddrLen := binary.BigEndian.Uint16(payload[offset:])
+	// Read local address
+	if offset+2 > len(payload) {
+		return "", 0, "", "", errors.New("payload truncated: missing local_addr length")
+	}
+	localAddrLen := int(binary.BigEndian.Uint16(payload[offset:]))
 	offset += 2
-	localAddr = string(payload[offset : offset+int(localAddrLen)])
-	offset += int(localAddrLen)
+	if offset+localAddrLen > len(payload) {
+		return "", 0, "", "", fmt.Errorf("invalid local_addr length: %d (remaining: %d)", localAddrLen, len(payload)-offset)
+	}
+	localAddr = string(payload[offset : offset+localAddrLen])
+	offset += localAddrLen
 
-	authTokenLen := binary.BigEndian.Uint16(payload[offset:])
+	// Read auth token
+	if offset+2 > len(payload) {
+		return "", 0, "", "", errors.New("payload truncated: missing auth_token length")
+	}
+	authTokenLen := int(binary.BigEndian.Uint16(payload[offset:]))
 	offset += 2
-	authToken = string(payload[offset : offset+int(authTokenLen)])
+	if offset+authTokenLen > len(payload) {
+		return "", 0, "", "", fmt.Errorf("invalid auth_token length: %d (remaining: %d)", authTokenLen, len(payload)-offset)
+	}
+	authToken = string(payload[offset : offset+authTokenLen])
 
 	return
 }

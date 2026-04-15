@@ -168,9 +168,12 @@ func (p *BinaryProtocol) Encode(msg *Message) ([]byte, error) {
 	// Get buffer from pool
 	buf := p.encodePool.Get()
 	if cap(*buf) < totalLen {
+		// Buffer too small, put it back and allocate a new one
+		// Note: this buffer cannot be returned to the original pool
+		// It will be garbage collected after use
 		p.encodePool.Put(buf)
-		newPool := pool.NewBufferPool(totalLen)
-		buf = newPool.Get()
+		newBuf := make([]byte, totalLen)
+		buf = &newBuf
 	}
 
 	offset := 0
@@ -628,8 +631,13 @@ func (f *muxForwarder) ForwardMux(ctx context.Context, localConn net.Conn, muxCo
 		if err != nil {
 			if err == io.EOF || IsClosedErr(err) {
 				// Send close message
-				closeMsg, _ := encoder.EncodeClose(connID)
-				muxConn.Write(closeMsg)
+				closeMsg, closeErr := encoder.EncodeClose(connID)
+				if closeErr != nil {
+					return fmt.Errorf("encode close failed: %w", closeErr)
+				}
+				if _, writeErr := muxConn.Write(closeMsg); writeErr != nil {
+					return fmt.Errorf("write close message failed: %w", writeErr)
+				}
 				encoder.Release(closeMsg)
 				return nil
 			}
@@ -643,13 +651,13 @@ func (f *muxForwarder) ForwardMux(ctx context.Context, localConn net.Conn, muxCo
 		// Encode and send
 		encoded, err := encoder.EncodeData(connID, (*buf)[:n])
 		if err != nil {
-			return err
+			return fmt.Errorf("encode data failed: %w", err)
 		}
 
 		_, err = muxConn.Write(encoded)
 		encoder.Release(encoded)
 		if err != nil {
-			return err
+			return fmt.Errorf("write encoded data failed: %w", err)
 		}
 	}
 }
@@ -720,9 +728,11 @@ func (f *bidirectionalMuxForwarder) ForwardBidirectionalMux(
 			n, err := localConn.Read(*buf)
 			if err != nil {
 				if err == io.EOF || IsClosedErr(err) {
-					closeMsg, _ := encoder.EncodeClose(connID)
-					muxConn.Write(closeMsg)
-					encoder.Release(closeMsg)
+					closeMsg, closeErr := encoder.EncodeClose(connID)
+					if closeErr == nil {
+						muxConn.Write(closeMsg)
+						encoder.Release(closeMsg)
+					}
 					errCh <- nil
 					return
 				}
@@ -731,7 +741,11 @@ func (f *bidirectionalMuxForwarder) ForwardBidirectionalMux(
 			}
 
 			if n > 0 {
-				encoded, _ := encoder.EncodeData(connID, (*buf)[:n])
+				encoded, encodeErr := encoder.EncodeData(connID, (*buf)[:n])
+				if encodeErr != nil {
+					errCh <- encodeErr
+					return
+				}
 				if _, err := muxConn.Write(encoded); err != nil {
 					encoder.Release(encoded)
 					errCh <- err
@@ -834,6 +848,18 @@ func NewMuxConnManager(muxConn io.ReadWriter, encoder MuxEncoder, decoder MuxDec
 	}
 }
 
+// countingWriter wraps an io.Writer and counts bytes written
+type countingWriter struct {
+	writer   io.Writer
+	bytesOut *atomic.Int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	w.bytesOut.Add(int64(n))
+	return n, err
+}
+
 // AddConnection adds a new connection and starts forwarding.
 func (m *MuxConnManager) AddConnection(connID string, localConn net.Conn) {
 	m.connections.Store(connID, localConn)
@@ -845,9 +871,15 @@ func (m *MuxConnManager) AddConnection(connID string, localConn net.Conn) {
 		OptimizeTCPConn(tcpConn)
 	}
 
+	// Create a counting writer to track bytesOut
+	countingMuxConn := &countingWriter{
+		writer:   m.muxConn,
+		bytesOut: &m.bytesOut,
+	}
+
 	// Start forwarding
 	go func() {
-		m.forwarder.ForwardMux(m.ctx, localConn, m.muxConn, connID, m.encoder)
+		m.forwarder.ForwardMux(m.ctx, localConn, countingMuxConn, connID, m.encoder)
 		m.RemoveConnection(connID)
 	}()
 }
