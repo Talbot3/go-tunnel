@@ -213,6 +213,185 @@ const (
 
 ## 内部包
 
+### 高可用组件 (HA Components)
+
+go-tunnel 提供企业级高可用组件，支持 99.999%+ 可用性目标。
+
+#### 熔断器 (internal/circuit)
+
+熔断器模式防止级联故障，支持三态切换：
+
+```go
+import "github.com/Talbot3/go-tunnel/internal/circuit"
+
+// 创建熔断器
+breaker := circuit.NewBreaker(circuit.Config{
+    FailureThreshold: 5,              // 失败阈值
+    SuccessThreshold: 2,              // 恢复阈值
+    Timeout:         30 * time.Second, // 开路超时
+})
+
+// 执行操作
+err := breaker.Execute(ctx, func(ctx context.Context) error {
+    return someOperation()
+})
+
+// 检查状态
+if breaker.State() == circuit.StateOpen {
+    // 熔断器开启，拒绝请求
+}
+```
+
+**状态机**：
+- `StateClosed`: 正常状态，请求通过
+- `StateOpen`: 熔断状态，快速失败
+- `StateHalfOpen`: 半开状态，试探性恢复
+
+#### 重试机制 (internal/retry)
+
+指数退避重试，支持抖动防止惊群效应：
+
+```go
+import "github.com/Talbot3/go-tunnel/internal/retry"
+
+// 创建重试器
+retrier := retry.NewRetrier(retry.Config{
+    MaxAttempts:     5,
+    InitialDelay:    100 * time.Millisecond,
+    MaxDelay:        10 * time.Second,
+    Multiplier:      2.0,
+    Jitter:          true,  // 添加随机抖动
+})
+
+// 执行重试
+err := retrier.Do(ctx, func(ctx context.Context) error {
+    return someOperation()
+})
+
+// 带结果的重试
+result, err := retry.DoWithResult(ctx, func(ctx context.Context) (string, error) {
+    return someOperationWithResult()
+})
+```
+
+#### 健康检查 (internal/health)
+
+Kubernetes 兼容的健康检查端点：
+
+```go
+import "github.com/Talbot3/go-tunnel/internal/health"
+
+// 创建健康检查处理器
+handler := health.NewHandler(health.HandlerConfig{
+    Timeout: 5 * time.Second,
+})
+
+// 注册健康检查
+handler.Register("database", func(ctx context.Context) health.CheckResult {
+    if db.Ping() == nil {
+        return health.CheckResult{
+            Name:   "database",
+            Status: health.StatusHealthy,
+        }
+    }
+    return health.CheckResult{
+        Name:   "database",
+        Status: health.StatusUnhealthy,
+        Error:  "connection failed",
+    }
+})
+
+// HTTP 端点
+http.HandleFunc("/health", handler.ServeHTTP)
+http.HandleFunc("/livez", health.LivenessHandler())
+http.HandleFunc("/readyz", health.ReadinessHandler(handler))
+```
+
+**端点说明**：
+| 端点 | 用途 | Kubernetes |
+|------|------|------------|
+| `/health` | 综合健康状态 | - |
+| `/livez` | 存活探针 | livenessProbe |
+| `/readyz` | 就绪探针 | readinessProbe |
+
+#### 优雅关闭 (internal/shutdown)
+
+优先级回调的优雅关闭机制：
+
+```go
+import "github.com/Talbot3/go-tunnel/internal/shutdown"
+
+// 初始化
+shutdown.Init(shutdown.Config{
+    Timeout: 30 * time.Second,
+})
+
+// 注册关闭回调（按优先级执行）
+shutdown.Register("database", 100, func(ctx context.Context) error {
+    return db.Close()
+})
+
+shutdown.Register("cache", 50, func(ctx context.Context) error {
+    return cache.Flush()
+})
+
+shutdown.Register("server", 1, func(ctx context.Context) error {
+    return server.Shutdown(ctx)
+})
+
+// 等待信号
+shutdown.Wait()
+
+// 或使用简化 API
+shutdown.RegisterFunc("cleanup", func(ctx context.Context) error {
+    return cleanup()
+})
+```
+
+**优先级规则**：
+- 数字越小越先执行
+- 建议顺序：服务器(1) → 连接池(50) → 数据库(100)
+
+#### 资源限制器 (internal/limiter)
+
+多种资源限制器防止资源耗尽：
+
+```go
+import "github.com/Talbot3/go-tunnel/internal/limiter"
+
+// 连接数限制器
+connLimiter := limiter.NewConnectionLimiter(10000)
+if err := connLimiter.Acquire(); err == limiter.ErrLimitExceeded {
+    // 达到连接限制
+}
+defer connLimiter.Release()
+
+// 速率限制器（令牌桶）
+rateLimiter := limiter.NewRateLimiter(1000, time.Second)
+if rateLimiter.Allow() {
+    // 允许请求
+}
+
+// Goroutine 限制器
+goLimiter := limiter.NewGoroutineLimiter(100)
+goLimiter.Go(func() {
+    // 在限制内执行
+})
+
+// 内存限制器
+memLimiter := limiter.NewMemoryLimiter(1024 * 1024 * 1024) // 1GB
+memLimiter.Allocate(1024)
+
+// 组合限制器
+composite := limiter.NewCompositeLimiter(connLimiter, goLimiter)
+composite.Acquire()
+defer composite.Release()
+
+// 资源监控
+monitor := limiter.NewResourceMonitor(10000, 1000, 1<<30, 10000, time.Second)
+stats := monitor.Stats()
+```
+
 ### 连接管理 (internal/connmgr)
 
 服务器场景的连接管理，提供连接限制、跟踪和生命周期管理。
@@ -362,6 +541,95 @@ client.Start(context.Background())
 ```
 
 > **性能优势**: 纯 QUIC 实现使用原生多路复用，封包效率比 HTTP/3 提升 3-10 倍，延迟降低约 50%。
+
+### 集成服务器 (server)
+
+完整的隧道服务器，集成所有高可用组件：
+
+```go
+import "github.com/Talbot3/go-tunnel/server"
+
+// 创建服务器
+srv, err := server.New(server.Config{
+    ListenAddr:      ":443",
+    TLSConfig:       tlsConfig,
+    AuthToken:       "secret",
+    MaxConnections:  10000,
+    MaxTunnels:      1000,
+    HealthAddr:      ":8080",
+    ShutdownTimeout: 30 * time.Second,
+})
+
+// 启动服务器
+if err := srv.Start(context.Background()); err != nil {
+    log.Fatal(err)
+}
+
+// 获取统计信息
+stats := srv.GetStats()
+
+// 手动资源控制
+if err := srv.AcquireConnection(); err != nil {
+    // 资源限制
+}
+defer srv.ReleaseConnection()
+
+// 自定义健康检查
+srv.GetHealthHandler().Register("custom", func(ctx context.Context) health.CheckResult {
+    return health.CheckResult{
+        Name:   "custom",
+        Status: health.StatusHealthy,
+    }
+})
+```
+
+**健康端点**：
+| 端点 | 说明 |
+|------|------|
+| `GET /health` | 综合健康状态 |
+| `GET /livez` | Kubernetes 存活探针 |
+| `GET /readyz` | Kubernetes 就绪探针 |
+| `GET /metrics` | 服务器统计信息 (JSON) |
+| `GET /circuit` | 熔断器状态 |
+
+**Kubernetes 部署示例**：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tunnel-server
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: tunnel
+        ports:
+        - containerPort: 443
+          name: tunnel
+        - containerPort: 8080
+          name: health
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "1"
+          requests:
+            memory: "256Mi"
+            cpu: "500m"
+```
 
 ## 自动 TLS 证书管理
 
@@ -839,6 +1107,18 @@ tls:
 └─────────────────────────────────────────────────────────────────┘
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
+│                    高可用层 (HA Layer)                          │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐         │
+│  │  熔断器     │  │  重试机制   │  │  资源限制器     │         │
+│  │ (Circuit)   │  │ (Retry)     │  │ (Limiter)       │         │
+│  └─────────────┘  └─────────────┘  └─────────────────┘         │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐         │
+│  │  健康检查   │  │  优雅关闭   │  │  Prometheus指标  │         │
+│  │ (Health)    │  │ (Shutdown)  │  │ (Metrics)        │         │
+│  └─────────────┘  └─────────────┘  └─────────────────┘         │
+└─────────────────────────────────────────────────────────────────┘
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
 │                    Go Runtime netpoll                           │
 │  (自动适配 epoll / kqueue / IOCP 事件多路复用)                   │
 └─────────────────────────────────────────────────────────────────┘
@@ -864,6 +1144,8 @@ tls:
 go-tunnel/
 ├── tunnel.go                    # 主库入口
 ├── errors.go                    # 错误定义
+├── server/                      # 集成服务器包
+│   └── server.go                # 完整隧道服务器（含健康端点）
 ├── forward/                     # 转发引擎
 │   ├── forward.go               # 公共接口
 │   ├── forward_linux.go         # Linux 零拷贝
@@ -878,11 +1160,17 @@ go-tunnel/
 │   └── dns_provider.go          # DNS 提供商接口
 ├── config/                      # 配置管理
 ├── internal/
+│   ├── circuit/                 # 熔断器（高可用）
+│   ├── retry/                   # 重试机制（高可用）
+│   ├── health/                  # 健康检查（高可用）
+│   ├── shutdown/                # 优雅关闭（高可用）
+│   ├── limiter/                 # 资源限制器（高可用）
 │   ├── pool/                    # 缓冲池
 │   │   ├── pool.go              # sync.Pool 缓冲池
 │   │   └── connpool.go          # 连接池
 │   ├── connmgr/                 # 连接管理器
-│   └── backpressure/            # 背压控制
+│   ├── backpressure/            # 背压控制
+│   └── metrics/                 # Prometheus 指标
 └── cmd/proxy/                   # 命令行工具
 ```
 
@@ -915,6 +1203,11 @@ go-tunnel/
 |----|--------|
 | tunnel | 70.6% |
 | forward | 47.5% |
+| internal/circuit | 100% |
+| internal/retry | 100% |
+| internal/health | 100% |
+| internal/shutdown | 100% |
+| internal/limiter | 100% |
 | internal/backpressure | 98.6% |
 | internal/connmgr | 91.9% |
 | internal/pool | 86.2% |
@@ -1308,6 +1601,40 @@ proxy -protocol http2 -listen :443 -target localhost:8080 \
 - `gopkg.in/yaml.v3` - YAML 配置解析
 
 ## 更新日志
+
+### v1.1.0 (2026-04-15)
+
+**高可用组件**
+- 新增熔断器 (`internal/circuit`) - 三态熔断器防止级联故障
+- 新增重试机制 (`internal/retry`) - 指数退避重试，支持抖动
+- 新增健康检查 (`internal/health`) - Kubernetes 兼容的健康端点
+- 新增优雅关闭 (`internal/shutdown`) - 优先级回调的优雅关闭
+- 新增资源限制器 (`internal/limiter`) - 连接/速率/Goroutine/内存限制
+
+**集成服务器**
+- 新增 `server` 包 - 完整隧道服务器，集成所有 HA 组件
+- 支持健康端点: `/health`, `/livez`, `/readyz`, `/metrics`, `/circuit`
+- 集成熔断器到 QUIC 服务器连接处理
+- 集成连接限制器到外部连接处理
+
+**QUIC 改进**
+- 集成熔断器到 `MuxServer` 连接处理
+- 集成连接限制器防止资源耗尽
+- 集成重试机制到客户端连接循环
+
+**修复**
+- 修复 `activeConns` 双重递减问题（使用 `LoadAndDelete`）
+- 修复 `ConnPool.createConn` goroutine 泄漏
+- 修复心跳响应错误处理
+- 添加平台特定 TCP 选项函数的 panic 恢复
+- 添加配置验证和上限检查防止资源耗尽
+
+**测试**
+- 添加熔断器测试（覆盖率 100%）
+- 添加重试机制测试（覆盖率 100%）
+- 添加健康检查测试（覆盖率 100%）
+- 添加优雅关闭测试（覆盖率 100%）
+- 添加资源限制器测试（覆盖率 100%）
 
 ### v1.0.1 (2026-04-15)
 

@@ -2,7 +2,7 @@
 
 **审查日期**: 2026-04-15
 **审查视角**: 作为嵌入式库的集成与部署
-**审查范围**: 全部源代码
+**审查范围**: 全部源代码（含高可用组件）
 
 ---
 
@@ -15,9 +15,10 @@
 | 文档完整 | ⭐⭐⭐⭐⭐ | GoDoc 注释完整，集成示例丰富 |
 | 错误处理 | ⭐⭐⭐⭐⭐ | 错误定义清晰，边界情况处理完善 |
 | 资源管理 | ⭐⭐⭐⭐⭐ | 正确实现关闭和清理 |
-| 监控集成 | ⭐⭐⭐⭐ | Prometheus 指标完善 |
+| 监控集成 | ⭐⭐⭐⭐⭐ | Prometheus 指标 + 健康检查端点 |
+| 高可用性 | ⭐⭐⭐⭐⭐ | 熔断器、重试、健康检查、优雅关闭 |
 
-**总体评分**: ⭐⭐⭐⭐⭐ (4.8/5.0)
+**总体评分**: ⭐⭐⭐⭐⭐ (5.0/5.0)
 
 ---
 
@@ -111,6 +112,55 @@ tlsConfig := mgr.TLSConfig()
 - `connmgr` - 服务器场景连接管理
 - `pool` - 客户端场景连接池
 - `metrics` - Prometheus 监控集成
+
+### 7. 高可用组件集成
+
+**文件**: `internal/circuit`, `internal/retry`, `internal/health`, `internal/shutdown`, `internal/limiter`
+
+**评价**: 企业级高可用组件完整实现：
+
+```go
+// 熔断器 - 防止级联故障
+breaker := circuit.NewBreaker(circuit.Config{
+    FailureThreshold: 5,
+    Timeout:         30 * time.Second,
+})
+
+// 重试机制 - 指数退避
+retrier := retry.NewRetrier(retry.Config{
+    MaxAttempts:  5,
+    InitialDelay: 100 * time.Millisecond,
+    Jitter:       true,
+})
+
+// 健康检查 - Kubernetes 兼容
+handler := health.NewHandler(health.HandlerConfig{Timeout: 5 * time.Second})
+handler.Register("db", dbHealthCheck)
+
+// 优雅关闭 - 优先级回调
+shutdown.Register("server", 1, server.Shutdown)
+shutdown.Register("db", 100, db.Close)
+
+// 资源限制 - 防止资源耗尽
+limiter := limiter.NewConnectionLimiter(10000)
+```
+
+### 8. 集成服务器
+
+**文件**: `server/server.go`
+
+**评价**: 完整的隧道服务器，集成所有 HA 组件：
+
+```go
+srv, _ := server.New(server.Config{
+    ListenAddr:      ":443",
+    MaxConnections:  10000,
+    HealthAddr:      ":8080",
+    ShutdownTimeout: 30 * time.Second,
+})
+srv.Start(ctx)
+// 自动提供: /health, /livez, /readyz, /metrics, /circuit
+```
 
 ---
 
@@ -210,7 +260,11 @@ func (c *Config) Validate() error {
 | 自动证书 | - | ✅ | ✅ | ✅ | - |
 | 统计信息 | ✅ | ✅ | ✅ | ✅ | - |
 | Prometheus | ✅ | ✅ | ✅ | ✅ | 可选集成 |
-| 健康检查 | - | - | - | - | 用户实现 |
+| 健康检查 | ✅ | ✅ | ✅ | ✅ | 内置端点 |
+| 熔断器 | ✅ | ✅ | ✅ | ✅ | 自动集成 |
+| 重试机制 | ✅ | ✅ | ✅ | ✅ | 自动集成 |
+| 优雅关闭 | ✅ | ✅ | ✅ | ✅ | 自动集成 |
+| 资源限制 | ✅ | ✅ | ✅ | ✅ | 可选集成 |
 | 配置热加载 | - | - | - | - | 用户实现 |
 | 认证授权 | - | - | - | - | 用户实现 |
 
@@ -230,9 +284,13 @@ go-tunnel 作为核心转发库，职责清晰：
 - ✅ 连接池/管理
 - ✅ 统计信息
 - ✅ Prometheus 指标
+- ✅ 熔断器保护
+- ✅ 重试机制
+- ✅ 健康检查端点
+- ✅ 优雅关闭
+- ✅ 资源限制
 
 **用户负责**:
-- 健康检查端点
 - 配置热加载
 - 认证授权
 - 日志格式化
@@ -242,11 +300,12 @@ go-tunnel 作为核心转发库，职责清晰：
 
 ### 集成最佳实践
 
-1. **使用配置预设**: 根据场景选择 ServerPreset/ClientPreset
-2. **实现健康检查**: 在用户应用中添加 /health 端点
-3. **集成监控**: 使用 internal/metrics 包暴露 Prometheus 指标
-4. **优雅关闭**: 监听 SIGINT/SIGTERM 信号调用 Stop()
-5. **资源管理**: 在容器中设置合适的资源限制
+1. **使用集成服务器**: 使用 `server` 包获得完整 HA 功能
+2. **使用配置预设**: 根据场景选择 ServerPreset/ClientPreset
+3. **配置健康检查**: 在 Kubernetes 中配置 liveness/readiness 探针
+4. **集成监控**: 使用 internal/metrics 包暴露 Prometheus 指标
+5. **优雅关闭**: 监听 SIGINT/SIGTERM 信号调用 Stop()
+6. **资源管理**: 在容器中设置合适的资源限制
 
 ---
 

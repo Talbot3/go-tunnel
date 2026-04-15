@@ -464,6 +464,69 @@ func loadTLSConfig() *tls.Config {
 
 ## 监控集成
 
+### 使用集成服务器（推荐）
+
+`server` 包提供了完整的隧道服务器，内置健康检查、熔断器、资源限制等高可用组件：
+
+```go
+package main
+
+import (
+    "context"
+    "crypto/tls"
+    "log"
+    "os"
+    "os/signal"
+    "syscall"
+
+    "github.com/Talbot3/go-tunnel/server"
+    autotls "github.com/Talbot3/go-tunnel/tls"
+)
+
+func main() {
+    // 自动 TLS
+    tlsMgr, _ := autotls.QuickSetup("admin@example.com", "tunnel.example.com")
+
+    // 创建集成服务器
+    srv, err := server.New(server.Config{
+        ListenAddr:      ":443",
+        TLSConfig:       tlsMgr.TLSConfig(),
+        AuthToken:       os.Getenv("TUNNEL_AUTH_TOKEN"),
+        MaxConnections:  10000,
+        MaxTunnels:      1000,
+        HealthAddr:      ":8080",
+        ShutdownTimeout: 30 * time.Second,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // 启动服务器
+    if err := srv.Start(context.Background()); err != nil {
+        log.Fatal(err)
+    }
+
+    log.Println("Server started on :443, health on :8080")
+
+    // 等待信号
+    sigCh := make(chan os.Signal, 1)
+    signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+    <-sigCh
+
+    srv.Stop()
+}
+```
+
+**内置健康端点**：
+
+| 端点 | 说明 | Kubernetes |
+|------|------|------------|
+| `GET /health` | 综合健康状态 | - |
+| `GET /livez` | 存活探针 | livenessProbe |
+| `GET /readyz` | 就绪探针 | readinessProbe |
+| `GET /metrics` | 服务器统计 (JSON) | - |
+| `GET /circuit` | 熔断器状态 | - |
+
 ### Prometheus 指标
 
 ```go
@@ -1520,8 +1583,17 @@ go-tunnel 的多路复用组件已集成以下优化：
 - [ ] 选择合适的协议 (TCP/HTTP/2/HTTP/3/QUIC)
 - [ ] 选择合适的配置预设 (ServerPreset/ClientPreset/HighThroughputPreset)
 - [ ] 配置 TLS 证书（安全协议必需）
-- [ ] 实现健康检查端点（Kubernetes 部署必需）
+- [ ] 使用集成服务器 `server` 包获得完整 HA 功能
+- [ ] 或手动实现健康检查端点（Kubernetes 部署必需）
 - [ ] 实现优雅关闭逻辑
+
+### 高可用配置
+
+- [ ] 配置熔断器阈值（防止级联故障）
+- [ ] 配置重试机制（指数退避 + 抖动）
+- [ ] 配置资源限制（连接数、内存、Goroutine）
+- [ ] 配置健康检查超时
+- [ ] 配置优雅关闭超时
 
 ### 部署时
 
@@ -1529,10 +1601,51 @@ go-tunnel 的多路复用组件已集成以下优化：
 - [ ] 配置监控指标端点
 - [ ] 配置日志输出
 - [ ] 配置资源限制
+- [ ] 配置 Kubernetes 探针
+
+### Kubernetes 部署示例
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tunnel-server
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: tunnel
+        ports:
+        - containerPort: 443
+          name: tunnel
+        - containerPort: 8080
+          name: health
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "1"
+          requests:
+            memory: "256Mi"
+            cpu: "500m"
+```
 
 ### 运维
 
 - [ ] 监控连接数、吞吐量、错误率
+- [ ] 监控熔断器状态
 - [ ] 设置告警规则
 - [ ] 定期检查证书有效期（自动 TLS 会自动续期）
 
