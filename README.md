@@ -18,6 +18,13 @@
 * **自适应背压控制 (Backpressure):** 借鉴 **Reactive Streams** 思想，内置水位监控，自动协调上下游速率，彻底杜绝因下游阻塞导致的服务端内存溢出（OOM）。
 * **原生 HTTP/3 支持:** 基于 `quic-go` 深度定制，支持 0-RTT 连接建立，在弱网环境下性能远超传统 TCP。
 
+## 📚 文档索引
+
+| 文档 | 说明 |
+|------|------|
+| [INTEGRATION.md](./INTEGRATION.md) | 集成部署指南 - 5 种场景示例、监控集成、部署检查清单 |
+| [CODE_REVIEW.md](./CODE_REVIEW.md) | 代码审查报告 - 架构评估、设计分析、改进建议 |
+
 ## 🛠 核心应用场景
 
 * **高性能边缘网关:** 作为微服务入口，处理海量 TLS 卸载与协议转换（如 H3 入，TCP 出）。
@@ -1202,18 +1209,26 @@ proxy -protocol http2 -listen :443 -target localhost:8080 \
 - 完整的 HTTP/3 实现，支持 QUIC 连接接受
 - 添加 `Stats.Reset()` 方法支持重置统计信息
 - 添加连接超时配置支持，防止连接泄漏
+- 添加 Prometheus 指标导出 (`internal/metrics` 包)
 
 **改进**
 - 定义 Windows `TCP_FASTOPEN` 常量，替换魔数
 - 添加 QUIC 单流限制文档说明
 - 添加 `.gitignore` 文件
+- 完善 DNS Provider 配置文档
 
 **测试**
+- 添加协议级别单元测试 (tcp, http2, http3, quic)
 - 添加 tunnel 包集成测试（覆盖率 70.6%）
 - 添加 forward 包测试（覆盖率 47.5%）
 - 添加 backpressure 包测试（覆盖率 98.6%）
 - 添加 connmgr 包测试（覆盖率 91.9%）
 - 添加 pool 包测试（覆盖率 86.2%）
+- 添加 metrics 包测试（覆盖率 100%）
+
+**文档**
+- 添加集成部署指南 (INTEGRATION.md)
+- 更新代码审查报告 (CODE_REVIEW.md)
 
 ## License
 
