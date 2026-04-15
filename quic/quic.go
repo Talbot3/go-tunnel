@@ -91,6 +91,14 @@ const (
 	ProtocolHTTP byte = 0x02
 )
 
+// Default intervals and sizes
+const (
+	defaultBufferSize      = 64 * 1024       // 64KB default buffer size
+	heartbeatInterval      = 15 * time.Second // Heartbeat interval
+	healthCheckInterval    = 30 * time.Second // Health check interval
+	defaultTunnelTimeout   = 5 * time.Minute  // Default tunnel timeout
+)
+
 // Errors
 var (
 	ErrInvalidMessageType  = errors.New("invalid message type")
@@ -225,7 +233,7 @@ func NewMuxServer(config MuxServerConfig) *MuxServer {
 	return &MuxServer{
 		config:      config,
 		portManager: NewPortManager(config.PortRangeStart, config.PortRangeEnd),
-		bufferPool:  pool.NewBufferPool(64 * 1024),
+		bufferPool:  pool.NewBufferPool(defaultBufferSize),
 	}
 }
 
@@ -472,7 +480,10 @@ func (s *MuxServer) controlLoop(tunnel *Tunnel) {
 		case MsgTypeHeartbeat:
 			// Send heartbeat ack
 			ack := []byte{MsgTypeHeartbeatAck}
-			tunnel.ControlStream.Write(ack)
+			if _, err := tunnel.ControlStream.Write(ack); err != nil {
+				log.Printf("[MuxServer] Heartbeat ack failed: %v", err)
+				return
+			}
 
 		case MsgTypeCloseConn:
 			// Close external connection
@@ -658,8 +669,11 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 		cancel() // Signal both goroutines to stop
 		extConn.Close()
 		stream.Close()
-		tunnel.ExternalConns.Delete(connID)
-		s.activeConns.Add(-1)
+		// Use LoadAndDelete to ensure only one decrement happens
+		// (closeTunnel might also try to close this connection)
+		if _, loaded := tunnel.ExternalConns.LoadAndDelete(connID); loaded {
+			s.activeConns.Add(-1)
+		}
 	}()
 
 	buf := s.bufferPool.Get()
@@ -730,6 +744,10 @@ func (s *MuxServer) closeTunnel(tunnel *Tunnel) {
 	}
 
 	// Close external connections - use LoadAndDelete to avoid duplicate processing
+	// Note: forwardBidirectional's defer will also try to decrement, but since we
+	// use LoadAndDelete, only one will succeed. The connection is force-closed here,
+	// so we decrement. If forwardBidirectional runs first, it will have already
+	// decremented and LoadAndDelete will return loaded=false.
 	tunnel.ExternalConns.Range(func(key, value interface{}) bool {
 		if conn, loaded := tunnel.ExternalConns.LoadAndDelete(key); loaded {
 			conn.(net.Conn).Close()
@@ -753,7 +771,7 @@ func (s *MuxServer) closeTunnel(tunnel *Tunnel) {
 func (s *MuxServer) healthCheck() {
 	defer s.wg.Done()
 
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(healthCheckInterval)
 	defer ticker.Stop()
 
 	for {
@@ -920,7 +938,7 @@ func NewMuxClient(config MuxClientConfig) *MuxClient {
 
 	return &MuxClient{
 		config:      config,
-		bufferPool:  pool.NewBufferPool(64 * 1024),
+		bufferPool:  pool.NewBufferPool(defaultBufferSize),
 		bp:          backpressure.NewController(),
 		reconnectCh: make(chan struct{}, 1),
 	}
@@ -1127,7 +1145,7 @@ func (s *MuxClient) readRegisterAck() error {
 func (s *MuxClient) heartbeatLoop() {
 	defer s.wg.Done()
 
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
 	for {
@@ -1288,8 +1306,13 @@ func (s *MuxClient) forwardLocalToControl(localConn net.Conn, connID string) {
 		s.localConns.Delete(connID)
 		s.activeConns.Add(-1)
 
-		closeMsg := buildCloseConnMessage(connID)
-		s.controlStream.Write(closeMsg)
+		// Only send close message if context is still valid and connected
+		if s.ctx.Err() == nil && s.connected.Load() {
+			closeMsg := buildCloseConnMessage(connID)
+			if _, err := s.controlStream.Write(closeMsg); err != nil {
+				log.Printf("[MuxClient] Write CLOSE failed: %v", err)
+			}
+		}
 	}()
 
 	buf := s.bufferPool.Get()

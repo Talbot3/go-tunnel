@@ -43,6 +43,13 @@ func applyMacOSTCPOptions(tc *net.TCPConn) {
 	}
 
 	raw.Control(func(fd uintptr) {
+		// Recover from potential panics in socket operations
+		defer func() {
+			if r := recover(); r != nil {
+				// Log but don't propagate - socket options are best-effort
+			}
+		}()
+
 		fdInt := int(fd)
 
 		// TCP_NOTSENT_LOWAT: Control when POLLOUT is generated

@@ -120,8 +120,8 @@ func TestForward_WriteError(t *testing.T) {
 }
 
 func TestIsClosedErr_Nil(t *testing.T) {
-	if !IsClosedErr(nil) {
-		t.Error("expected nil to be a closed error")
+	if IsClosedErr(nil) {
+		t.Error("expected nil to NOT be a closed error (nil means no error)")
 	}
 }
 

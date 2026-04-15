@@ -162,8 +162,22 @@ func NewBinaryProtocol() *BinaryProtocol {
 func (p *BinaryProtocol) Encode(msg *Message) ([]byte, error) {
 	idBytes := []byte(msg.ID)
 
-	// Calculate total length
+	// Validate sizes to prevent overflow and ensure protocol limits
+	const maxIDLen = 65535      // max uint16
+	const maxPayloadLen = 1<<31 // 2GB max to avoid int overflow issues on 32-bit
+
+	if len(idBytes) > maxIDLen {
+		return nil, fmt.Errorf("ID too long: %d bytes (max %d)", len(idBytes), maxIDLen)
+	}
+	if len(msg.Payload) > maxPayloadLen {
+		return nil, fmt.Errorf("payload too long: %d bytes (max %d)", len(msg.Payload), maxPayloadLen)
+	}
+
+	// Calculate total length with overflow check
 	totalLen := 1 + 2 + len(idBytes) + 4 + len(msg.Payload)
+	if totalLen < 0 || totalLen > maxPayloadLen+maxIDLen+7 {
+		return nil, fmt.Errorf("message too large: total length overflow")
+	}
 
 	// Get buffer from pool
 	buf := p.encodePool.Get()

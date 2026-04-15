@@ -54,6 +54,13 @@ func applyWindowsTCPOptions(tc *net.TCPConn) {
 	}
 
 	raw.Control(func(fd uintptr) {
+		// Recover from potential panics in socket operations
+		defer func() {
+			if r := recover(); r != nil {
+				// Log but don't propagate - socket options are best-effort
+			}
+		}()
+
 		// Enable TCP_NODELAY for lower latency
 		syscall.SetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
 

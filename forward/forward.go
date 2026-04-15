@@ -27,9 +27,10 @@ func NewForwarder() Forwarder {
 }
 
 // IsClosedErr returns true if the error indicates a normal connection close.
+// Returns false for nil error (no error means not a "closed" error).
 func IsClosedErr(err error) bool {
 	if err == nil {
-		return true
+		return false // No error, not a "closed" error
 	}
 	if err == io.EOF {
 		return true

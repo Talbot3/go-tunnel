@@ -302,9 +302,19 @@ func NewWithContext(ctx context.Context, cfg Config) (*Tunnel, error) {
 
 // validateConfig validates and sets defaults for the configuration.
 func validateConfig(cfg *Config) error {
+	// Maximum allowed values to prevent resource exhaustion
+	const (
+		maxBufferSize            = 10 * 1024 * 1024  // 10MB
+		maxBackpressureWatermark = 100 * 1024 * 1024 // 100MB
+		maxConnections           = 1000000           // 1M connections
+	)
+
 	// Validate BufferSize
 	if cfg.BufferSize < 0 {
 		return fmt.Errorf("BufferSize must be non-negative, got %d", cfg.BufferSize)
+	}
+	if cfg.BufferSize > maxBufferSize {
+		return fmt.Errorf("BufferSize too large: %d (max %d)", cfg.BufferSize, maxBufferSize)
 	}
 	if cfg.BufferSize == 0 {
 		cfg.BufferSize = pool.DefaultBufferSize
@@ -319,21 +329,36 @@ func validateConfig(cfg *Config) error {
 	if cfg.MaxConnections < 0 {
 		return fmt.Errorf("MaxConnections must be non-negative, got %d", cfg.MaxConnections)
 	}
+	if cfg.MaxConnections > maxConnections {
+		return fmt.Errorf("MaxConnections too large: %d (max %d)", cfg.MaxConnections, maxConnections)
+	}
 
 	// Validate buffer sizes
 	if cfg.ReadBufferSize < 0 {
 		return fmt.Errorf("ReadBufferSize must be non-negative, got %d", cfg.ReadBufferSize)
 	}
+	if cfg.ReadBufferSize > maxBufferSize {
+		return fmt.Errorf("ReadBufferSize too large: %d (max %d)", cfg.ReadBufferSize, maxBufferSize)
+	}
 	if cfg.WriteBufferSize < 0 {
 		return fmt.Errorf("WriteBufferSize must be non-negative, got %d", cfg.WriteBufferSize)
+	}
+	if cfg.WriteBufferSize > maxBufferSize {
+		return fmt.Errorf("WriteBufferSize too large: %d (max %d)", cfg.WriteBufferSize, maxBufferSize)
 	}
 
 	// Validate backpressure watermarks
 	if cfg.BackpressureHighWatermark < 0 {
 		return fmt.Errorf("BackpressureHighWatermark must be non-negative, got %d", cfg.BackpressureHighWatermark)
 	}
+	if cfg.BackpressureHighWatermark > maxBackpressureWatermark {
+		return fmt.Errorf("BackpressureHighWatermark too large: %d (max %d)", cfg.BackpressureHighWatermark, maxBackpressureWatermark)
+	}
 	if cfg.BackpressureLowWatermark < 0 {
 		return fmt.Errorf("BackpressureLowWatermark must be non-negative, got %d", cfg.BackpressureLowWatermark)
+	}
+	if cfg.BackpressureLowWatermark > maxBackpressureWatermark {
+		return fmt.Errorf("BackpressureLowWatermark too large: %d (max %d)", cfg.BackpressureLowWatermark, maxBackpressureWatermark)
 	}
 	if cfg.BackpressureHighWatermark > 0 && cfg.BackpressureLowWatermark > 0 {
 		if cfg.BackpressureLowWatermark >= cfg.BackpressureHighWatermark {
