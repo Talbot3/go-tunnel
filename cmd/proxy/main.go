@@ -279,9 +279,12 @@ func createTunnel(proto, listen, target string, tlsConfig *tls.Config) (*tunnel.
 			return nil, fmt.Errorf("TLS config required for QUIC")
 		}
 		if len(tlsConfig.NextProtos) == 0 {
-			tlsConfig.NextProtos = []string{"quic-proxy"}
+			tlsConfig.NextProtos = []string{"quic-tunnel"}
 		}
-		p = quic.New(tlsConfig, nil)
+		// Use MuxServer for QUIC multiplexing
+		p = quic.NewMuxServer(quic.MuxServerConfig{
+			TLSConfig: tlsConfig,
+		})
 	default:
 		return nil, fmt.Errorf("unknown protocol: %s", proto)
 	}

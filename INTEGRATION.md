@@ -171,26 +171,26 @@ func main() {
     // 自动 TLS
     tlsMgr, _ := autotls.QuickSetup("admin@example.com", "tunnel.example.com")
 
-    // 服务器预设：高并发
-    cfg := tunnel.ServerPreset()
-    cfg.ListenAddr = ":443"
-    cfg.TargetAddr = "localhost:8080" // 本地服务
-    cfg.TLSConfig = tlsMgr.TLSConfig()
-
-    t, _ := tunnel.New(cfg)
-    t.SetProtocol(quic.New(cfg.TLSConfig, quic.DefaultConfig()))
+    // QUIC 多路复用服务器
+    server := quic.NewMuxServer(quic.MuxServerConfig{
+        ListenAddr:     ":443",
+        TLSConfig:      tlsMgr.TLSConfig(),
+        AuthToken:      "your-secret-token",
+        PortRangeStart: 10000,
+        PortRangeEnd:   20000,
+    })
 
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
-    t.Start(ctx)
-    log.Println("Tunnel server started on :443")
+    server.Start(ctx)
+    log.Println("QUIC tunnel server started on :443")
 
     // 等待信号
     sigCh := make(chan os.Signal, 1)
     signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
     <-sigCh
-    t.Stop()
+    server.Stop()
 }
 ```
 
@@ -212,28 +212,27 @@ import (
 )
 
 func main() {
-    // 客户端预设：高吞吐
-    cfg := tunnel.ClientPreset()
-    cfg.ListenAddr = ":8080" // 本地监听
-    cfg.TargetAddr = "tunnel.example.com:443"
-    cfg.TLSConfig = &tls.Config{
-        InsecureSkipVerify: false,
-        NextProtos:         []string{"quic-proxy"},
-    }
-
-    t, _ := tunnel.New(cfg)
-    t.SetProtocol(quic.New(cfg.TLSConfig, quic.DefaultConfig()))
+    // QUIC 多路复用客户端
+    client := quic.NewMuxClient(quic.MuxClientConfig{
+        ServerAddr: "tunnel.example.com:443",
+        TLSConfig: &tls.Config{
+            InsecureSkipVerify: false,
+            NextProtos:         []string{"quic-tunnel"},
+        },
+        LocalAddr:  "localhost:8080",
+        AuthToken:  "your-secret-token",
+    })
 
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
 
-    t.Start(ctx)
-    log.Println("Tunnel client started on :8080")
+    client.Start(ctx)
+    log.Println("QUIC tunnel client connected to tunnel.example.com:443")
 
     sigCh := make(chan os.Signal, 1)
     signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
     <-sigCh
-    t.Stop()
+    client.Stop()
 }
 ```
 
@@ -1489,7 +1488,7 @@ go-tunnel 的多路复用组件已集成以下优化：
 
 | 能力 | 用途 | 相关 API |
 |------|------|----------|
-| 协议支持 | 控制通道协议选择 | `http2.New()`, `quic.New()` |
+| 协议支持 | 控制通道协议选择 | `http2.New()`, `quic.NewMuxServer()`, `quic.NewMuxClient()` |
 | 多路复用 | 共享连接多路转发 | `forward.MuxForwarder`, `forward.MuxConnManager` |
 | 数据转发 | 高性能双向转发 | `tunnel.HandlePair()`, `tunnel.NewForwarder()` |
 | 服务器优化 | 高并发处理 | `tunnel.ServerPreset()` |

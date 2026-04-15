@@ -554,16 +554,15 @@ dataStream.Write(rawData)
 
 ## 五、实现建议
 
-### 5.1 新增文件
+### 5.1 实现文件
 
 ```
 quic/
-├── quic.go          # 现有单 stream 实现
-├── mux.go           # 新增：多路复用支持
-├── mux_server.go    # 新增：服务器实现
-├── mux_client.go    # 新增：客户端实现
-└── mux_test.go      # 新增：测试
+├── quic.go          # 纯 QUIC 多路复用实现 (MuxServer/MuxClient)
+└── quic_test.go     # 测试
 ```
+
+**实现状态**: ✅ 已完成 (2026-04-15)
 
 ### 5.2 API 设计
 
@@ -585,7 +584,7 @@ client := quic.NewMuxClient(quic.MuxClientConfig{
     ServerAddr: "tunnel.example.com:443",
     TLSConfig:  tlsConfig,
     QUICConfig: quic.DefaultConfig(),
-    Protocol:   "tcp",
+    Protocol:   quic.ProtocolTCP,
     LocalAddr:  "localhost:8080",
     AuthToken:  "secret",
 })
@@ -593,11 +592,12 @@ client := quic.NewMuxClient(quic.MuxClientConfig{
 client.Start(ctx)
 ```
 
-### 5.3 向后兼容
+### 5.3 实现说明
 
-- 保留现有 `quic.New()` 单 stream 实现
-- 新增 `quic.NewMuxServer()` / `quic.NewMuxClient()` 多路复用实现
-- 用户可根据需求选择
+- 已移除旧的 `quic.New()` 单 stream 实现
+- 使用 `quic.NewMuxServer()` / `quic.NewMuxClient()` 多路复用实现
+- 控制流使用二进制协议封装控制消息
+- 数据流直接传输原始数据，实现最高效率
 
 ---
 
@@ -609,23 +609,25 @@ client.Start(ctx)
 |--------|------|
 | 技术可行性 | ✅ 完全可行，quic-go 提供完整支持 |
 | 性能提升 | ✅ 封包效率提升 3-10 倍，延迟降低 50% |
-| 实现复杂度 | ⚠️ 中等，需要管理 stream 生命周期 |
-| 维护成本 | ⚠️ 需要自定义协议，调试相对复杂 |
-| 向后兼容 | ✅ 可与现有实现共存 |
+| 实现复杂度 | ✅ 已完成，使用 stream 生命周期管理 |
+| 维护成本 | ✅ 二进制协议，日志完善 |
+| 实现状态 | ✅ 已完成 (2026-04-15) |
 
-### 6.2 建议
+### 6.2 实现结果
 
-1. **推荐实施**：纯 QUIC + 多 Stream 模式
+1. **已实施**：纯 QUIC + 多 Stream 模式
 2. **实现策略**：
-   - 控制流使用 MuxEncoder 封装
+   - 控制流使用二进制协议封装控制消息
    - 数据流直接传输原始数据
-3. **优先级**：P1（重要优化）
-4. **预计工作量**：2-3 天
+3. **集成**：
+   - 与 `forward/mux.go` MuxEncoder/MuxDecoder 集成
+   - 使用 `internal/pool` 缓冲池
+   - 使用 `internal/backpressure` 背压控制
 
-### 6.3 风险
+### 6.3 风险与缓解
 
-| 风险 | 缓解措施 |
-|------|----------|
-| Stream 管理复杂 | 使用 MuxConnManager 统一管理 |
-| 协议兼容性 | 版本号 + 向后兼容设计 |
-| 调试困难 | 添加详细日志 + 提供调试工具 |
+| 风险 | 缓解措施 | 状态 |
+|------|----------|------|
+| Stream 管理复杂 | 使用 sync.Map + 生命周期管理 | ✅ 已实现 |
+| 协议兼容性 | 二进制协议 + 版本号 | ✅ 已实现 |
+| 调试困难 | 详细日志输出 | ✅ 已实现 |

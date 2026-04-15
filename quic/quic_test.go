@@ -8,41 +8,78 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"math/big"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/Talbot3/go-tunnel/quic"
 )
 
-func TestProtocol_Name(t *testing.T) {
-	tlsConfig := &tls.Config{NextProtos: []string{"quic-proxy"}}
-	p := quic.New(tlsConfig, nil)
-	if p.Name() != "quic" {
-		t.Errorf("Expected name 'quic', got '%s'", p.Name())
-	}
-}
-
-func TestProtocol_Forwarder(t *testing.T) {
-	tlsConfig := &tls.Config{NextProtos: []string{"quic-proxy"}}
-	p := quic.New(tlsConfig, nil)
-	fwd := p.Forwarder()
-	if fwd == nil {
-		t.Error("Expected non-nil forwarder")
-	}
-}
-
-func TestProtocol_ListenInvalidAddress(t *testing.T) {
+func TestMuxServer_Name(t *testing.T) {
 	cert := generateTestCertificate(t)
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"quic-proxy"},
+		NextProtos:   []string{"quic-tunnel"},
 	}
-	p := quic.New(tlsConfig, nil)
 
-	_, err := p.Listen("invalid:address")
+	server := quic.NewMuxServer(quic.MuxServerConfig{
+		ListenAddr: ":0",
+		TLSConfig:  tlsConfig,
+	})
+
+	if server.Name() != "quic-mux" {
+		t.Errorf("Expected name 'quic-mux', got '%s'", server.Name())
+	}
+}
+
+func TestMuxServer_StartInvalidAddress(t *testing.T) {
+	cert := generateTestCertificate(t)
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"quic-tunnel"},
+	}
+
+	server := quic.NewMuxServer(quic.MuxServerConfig{
+		ListenAddr: "invalid:address:format",
+		TLSConfig:  tlsConfig,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	err := server.Start(ctx)
 	if err == nil {
 		t.Error("Expected error for invalid address")
+		server.Stop()
 	}
+}
+
+func TestMuxClient_InvalidServer(t *testing.T) {
+	cert := generateTestCertificate(t)
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"quic-tunnel"},
+		InsecureSkipVerify: true,
+	}
+
+	client := quic.NewMuxClient(quic.MuxClientConfig{
+		ServerAddr: "10.255.255.1:12345",
+		TLSConfig:  tlsConfig,
+		LocalAddr:  "localhost:8080",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	// Start returns immediately and runs connection loop in background
+	err := client.Start(ctx)
+	if err != nil {
+		t.Error("Start should not return error immediately")
+	}
+	defer client.Stop()
+
+	// Wait for context to be done (connection will fail in background)
+	<-ctx.Done()
 }
 
 func TestDefaultConfig(t *testing.T) {
@@ -65,47 +102,117 @@ func TestIsQUICClosedErr(t *testing.T) {
 	}
 }
 
-func TestProtocol_ListenAndAddr(t *testing.T) {
+func TestMuxServer_GetStats(t *testing.T) {
 	cert := generateTestCertificate(t)
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"quic-proxy"},
+		NextProtos:   []string{"quic-tunnel"},
 	}
-	p := quic.New(tlsConfig, nil)
 
-	listener, err := p.Listen("127.0.0.1:0")
+	server := quic.NewMuxServer(quic.MuxServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		TLSConfig:  tlsConfig,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := server.Start(ctx)
 	if err != nil {
-		t.Fatalf("Failed to listen: %v", err)
+		t.Fatalf("Failed to start server: %v", err)
 	}
-	defer listener.Close()
+	defer server.Stop()
 
-	if listener.Addr() == nil {
-		t.Error("Expected non-nil address")
-	}
+	// Wait for server to be ready
+	time.Sleep(100 * time.Millisecond)
 
-	// Verify it's a UDP address
-	addr := listener.Addr().String()
-	if addr == "" {
-		t.Error("Expected non-empty address string")
+	stats := server.GetStats()
+	if stats.ActiveTunnels != 0 {
+		t.Errorf("Expected 0 active tunnels, got %d", stats.ActiveTunnels)
 	}
 }
 
-func TestProtocol_DialInvalidAddress(t *testing.T) {
+func TestMuxServer_MuxClient_Integration(t *testing.T) {
 	cert := generateTestCertificate(t)
-	tlsConfig := &tls.Config{
+	serverTLSConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"quic-proxy"},
-		InsecureSkipVerify: true,
+		NextProtos:   []string{"quic-tunnel"},
 	}
-	p := quic.New(tlsConfig, nil)
 
-	ctx, cancel := contextWithTimeout(100 * time.Millisecond)
+	// Start local echo server
+	echoListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to start echo server: %v", err)
+	}
+	defer echoListener.Close()
+
+	echoAddr := echoListener.Addr().String()
+	go runEchoServer(echoListener)
+
+	// Start QUIC server
+	server := quic.NewMuxServer(quic.MuxServerConfig{
+		ListenAddr:     "127.0.0.1:0",
+		TLSConfig:      serverTLSConfig,
+		PortRangeStart: 20000,
+		PortRangeEnd:   20100,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Dial to an address that won't respond
-	_, err := p.Dial(ctx, "10.255.255.1:12345")
-	if err == nil {
-		t.Error("Expected error for non-routable address")
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	// Get server address
+	serverAddr := server.Addr()
+	if serverAddr == nil {
+		t.Fatal("Server address is nil")
+	}
+
+	// Start QUIC client
+	clientTLSConfig := &tls.Config{
+		NextProtos:         []string{"quic-tunnel"},
+		InsecureSkipVerify: true,
+	}
+
+	client := quic.NewMuxClient(quic.MuxClientConfig{
+		ServerAddr: serverAddr.String(),
+		TLSConfig:  clientTLSConfig,
+		LocalAddr:  echoAddr,
+		AuthToken:  "test-token",
+	})
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("Failed to start client: %v", err)
+	}
+	defer client.Stop()
+
+	// Wait for registration
+	time.Sleep(200 * time.Millisecond)
+
+	stats := client.GetStats()
+	t.Logf("Client stats: ActiveConns=%d, TotalConns=%d", stats.ActiveConns, stats.TotalConns)
+}
+
+func runEchoServer(ln net.Listener) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			buf := make([]byte, 1024)
+			for {
+				n, err := c.Read(buf)
+				if err != nil {
+					return
+				}
+				c.Write(buf[:n])
+			}
+		}(conn)
 	}
 }
 
@@ -127,8 +234,10 @@ func generateTestCertificate(t *testing.T) tls.Certificate {
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:              []string{"localhost"},
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
@@ -140,8 +249,4 @@ func generateTestCertificate(t *testing.T) tls.Certificate {
 		Certificate: [][]byte{certDER},
 		PrivateKey:  key,
 	}
-}
-
-func contextWithTimeout(d time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), d)
 }

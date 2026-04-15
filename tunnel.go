@@ -45,8 +45,9 @@
 //	// HTTP/3
 //	p := http3.New(tlsConfig, nil)
 //
-//	// QUIC
-//	p := quic.New(tlsConfig, nil)
+//	// QUIC (multiplexing)
+//	server := quic.NewMuxServer(quic.MuxServerConfig{TLSConfig: tlsConfig})
+//	client := quic.NewMuxClient(quic.MuxClientConfig{ServerAddr: "server:443", TLSConfig: tlsConfig})
 package tunnel
 
 import (
@@ -65,7 +66,7 @@ import (
 )
 
 // Version returns the library version.
-const Version = "1.0.0"
+const Version = "1.1.0"
 
 // Forwarder defines the interface for bidirectional data forwarding.
 type Forwarder interface {
