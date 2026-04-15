@@ -60,7 +60,10 @@ import (
 
 	"github.com/Talbot3/go-tunnel/forward"
 	"github.com/Talbot3/go-tunnel/internal/backpressure"
+	"github.com/Talbot3/go-tunnel/internal/circuit"
+	"github.com/Talbot3/go-tunnel/internal/limiter"
 	"github.com/Talbot3/go-tunnel/internal/pool"
+	"github.com/Talbot3/go-tunnel/internal/retry"
 )
 
 // ============================================
@@ -188,6 +191,12 @@ type MuxServer struct {
 	bytesIn       atomic.Int64
 	bytesOut      atomic.Int64
 
+	// Circuit breaker for connection handling
+	circuitBreaker *circuit.Breaker
+
+	// Connection limiter
+	connLimiter *limiter.ConnectionLimiter
+
 	// Lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -230,10 +239,26 @@ func NewMuxServer(config MuxServerConfig) *MuxServer {
 		config.QUICConfig = DefaultConfig()
 	}
 
+	// Create circuit breaker for connection handling
+	circuitConfig := circuit.Config{
+		FailureThreshold: 5,
+		SuccessThreshold: 3,
+		Timeout:          30 * time.Second,
+		MaxRequests:      10,
+		OnStateChange: func(from, to circuit.State) {
+			log.Printf("[MuxServer] Circuit breaker: %v -> %v", from, to)
+		},
+	}
+
+	// Create connection limiter
+	connLimiter := limiter.NewConnectionLimiter(int64(config.MaxConnsPerTunnel * config.MaxTunnels))
+
 	return &MuxServer{
-		config:      config,
-		portManager: NewPortManager(config.PortRangeStart, config.PortRangeEnd),
-		bufferPool:  pool.NewBufferPool(defaultBufferSize),
+		config:         config,
+		portManager:    NewPortManager(config.PortRangeStart, config.PortRangeEnd),
+		bufferPool:     pool.NewBufferPool(defaultBufferSize),
+		circuitBreaker: circuit.NewBreaker(circuitConfig),
+		connLimiter:    connLimiter,
 	}
 }
 
@@ -322,9 +347,16 @@ func (s *MuxServer) handleConnection(conn quic.Connection) {
 	defer s.wg.Done()
 	defer conn.CloseWithError(0, "connection closed")
 
+	// Check circuit breaker
+	if err := s.circuitBreaker.Allow(); err != nil {
+		log.Printf("[MuxServer] Circuit breaker open, rejecting connection: %v", err)
+		return
+	}
+
 	// Accept control stream
 	stream, err := conn.AcceptStream(s.ctx)
 	if err != nil {
+		s.circuitBreaker.RecordFailure()
 		return
 	}
 
@@ -427,6 +459,9 @@ func (s *MuxServer) handleControlStream(conn quic.Connection, stream quic.Stream
 	s.tunnels.Store(tunnelID, tunnel)
 	s.activeTunnels.Add(1)
 	s.totalTunnels.Add(1)
+
+	// Record success for circuit breaker
+	s.circuitBreaker.RecordSuccess()
 
 	// Send register ack
 	s.sendRegisterAck(stream, tunnelID, publicURL, port, "")
@@ -592,6 +627,14 @@ func (s *MuxServer) startExternalListener(tunnel *Tunnel) {
 // handleExternalConnection handles external connection
 func (s *MuxServer) handleExternalConnection(tunnel *Tunnel, extConn net.Conn) {
 	defer s.wg.Done()
+
+	// Check connection limit
+	if err := s.connLimiter.Acquire(); err != nil {
+		log.Printf("[MuxServer] Connection limit exceeded, rejecting: %v", err)
+		extConn.Close()
+		return
+	}
+	defer s.connLimiter.Release()
 
 	// Generate connID
 	connID := generateID()
@@ -983,6 +1026,19 @@ func (s *MuxClient) connectLoop() {
 
 	reconnectTries := 0
 
+	// Create retrier with exponential backoff
+	retrier := retry.NewRetrier(retry.Config{
+		MaxAttempts:  s.config.MaxReconnectTries,
+		InitialDelay: s.config.ReconnectInterval,
+		MaxDelay:     5 * time.Minute,
+		Multiplier:   2.0,
+		Jitter:       0.1,
+		RetryableError: func(err error) bool {
+			// All connection errors are retryable
+			return true
+		},
+	})
+
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -990,22 +1046,22 @@ func (s *MuxClient) connectLoop() {
 		default:
 		}
 
-		if err := s.connect(); err != nil {
-			log.Printf("[MuxClient] Connect failed: %v", err)
+		err := retrier.Do(s.ctx, func() error {
+			return s.connect()
+		})
+
+		if err != nil {
+			if s.ctx.Err() != nil {
+				return // Context canceled
+			}
+			log.Printf("[MuxClient] Connect failed after retries: %v", err)
 
 			if s.config.MaxReconnectTries > 0 && reconnectTries >= s.config.MaxReconnectTries {
 				log.Printf("[MuxClient] Max reconnect tries reached")
 				return
 			}
 			reconnectTries++
-
-			select {
-			case <-s.ctx.Done():
-				return
-			case <-time.After(s.config.ReconnectInterval):
-				log.Printf("[MuxClient] Reconnecting... (attempt %d)", reconnectTries)
-				continue
-			}
+			continue
 		}
 
 		reconnectTries = 0
