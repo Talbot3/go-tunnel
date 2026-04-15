@@ -494,3 +494,58 @@ func BenchmarkMuxForwarder_ForwardMux(b *testing.B) {
 		mux2.Close()
 	}
 }
+
+// ============================================
+// Binary Protocol Benchmarks (Optimized)
+// ============================================
+
+func BenchmarkBinaryProtocol_Encode(b *testing.B) {
+	p := NewBinaryProtocol()
+	data := make([]byte, 1024)
+	msg := &Message{Type: MsgTypeData, ID: "conn1", Payload: data}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		encoded, _ := p.Encode(msg)
+		p.Release(encoded)
+	}
+}
+
+func BenchmarkBinaryProtocol_Decode(b *testing.B) {
+	p := NewBinaryProtocol()
+	data := make([]byte, 1024)
+	msg := &Message{Type: MsgTypeData, ID: "conn1", Payload: data}
+	encoded, _ := p.Encode(msg)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.Decode(encoded)
+	}
+}
+
+func BenchmarkBinaryProtocol_EncodeDecode(b *testing.B) {
+	p := NewBinaryProtocol()
+	data := make([]byte, 1024)
+	msg := &Message{Type: MsgTypeData, ID: "conn1", Payload: data}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		encoded, _ := p.Encode(msg)
+		p.Decode(encoded)
+		p.Release(encoded)
+	}
+}
+
+// Zero-allocation encoder benchmark
+func BenchmarkBinaryProtocol_Encode_ZeroAlloc(b *testing.B) {
+	p := NewBinaryProtocol()
+	data := make([]byte, 1024)
+	msg := &Message{Type: MsgTypeData, ID: "conn1", Payload: data}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		encoded, _ := p.Encode(msg)
+		p.Release(encoded)
+	}
+}

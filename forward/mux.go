@@ -295,60 +295,199 @@ var (
 )
 
 // ============================================
-// Text Protocol Implementation (Legacy)
+// Text Protocol Implementation (Optimized with buffer pool)
 // ============================================
 
-// DefaultMuxEncoder implements MuxEncoder with a text-based protocol (legacy).
+// DefaultMuxEncoder implements MuxEncoder with a text-based protocol.
+// Optimized with buffer pool and avoiding fmt.Sprintf allocations.
 type DefaultMuxEncoder struct {
 	Delimiter byte
+	buf       []byte // Pre-allocated buffer for encoding
+	bufPool   *pool.BufferPool
 }
 
 // NewDefaultMuxEncoder creates a new default mux encoder.
 func NewDefaultMuxEncoder() *DefaultMuxEncoder {
-	return &DefaultMuxEncoder{Delimiter: '\n'}
+	return &DefaultMuxEncoder{
+		Delimiter: '\n',
+		buf:       make([]byte, 64*1024), // Pre-allocate 64KB buffer
+		bufPool:   pool.NewBufferPool(64 * 1024),
+	}
+}
+
+// getBuffer returns a buffer with at least 'size' capacity
+func (e *DefaultMuxEncoder) getBuffer(size int) []byte {
+	if size <= cap(e.buf) {
+		return e.buf[:cap(e.buf)]
+	}
+	// For larger payloads, get from pool
+	b := e.bufPool.Get()
+	if cap(*b) < size {
+		e.bufPool.Put(b)
+		*b = make([]byte, size)
+	}
+	return *b
+}
+
+// writeInt writes an integer to buffer without allocations
+func writeInt(buf []byte, offset int, n int) int {
+	if n == 0 {
+		buf[offset] = '0'
+		return offset + 1
+	}
+
+	// Write digits in reverse order
+	start := offset
+	for n > 0 {
+		buf[offset] = byte('0' + n%10)
+		offset++
+		n /= 10
+	}
+
+	// Reverse the digits
+	for i, j := start, offset-1; i < j; i, j = i+1, j-1 {
+		buf[i], buf[j] = buf[j], buf[i]
+	}
+
+	return offset
 }
 
 // EncodeData encodes a data message.
 func (e *DefaultMuxEncoder) EncodeData(connID string, data []byte) ([]byte, error) {
-	header := fmt.Sprintf("DATA:%s:%d:", connID, len(data))
-	result := make([]byte, len(header)+len(data)+1)
-	copy(result, header)
-	copy(result[len(header):], data)
-	result[len(result)-1] = e.Delimiter
+	// Calculate total length: DATA:connID:len:data\n
+	connIDLen := len(connID)
+	dataLen := len(data)
+
+	// Estimate max header length: "DATA:" + connID + ":" + max 10 digits + ":" = 5 + len + 1 + 10 + 1
+	maxTotalLen := 5 + connIDLen + 1 + 10 + 1 + dataLen + 1
+
+	buf := e.getBuffer(maxTotalLen)
+
+	offset := 0
+
+	// Write "DATA:"
+	copy(buf[offset:], "DATA:")
+	offset += 5
+
+	// Write connID
+	copy(buf[offset:], connID)
+	offset += connIDLen
+
+	// Write ":"
+	buf[offset] = ':'
+	offset++
+
+	// Write data length
+	offset = writeInt(buf, offset, dataLen)
+
+	// Write ":"
+	buf[offset] = ':'
+	offset++
+
+	// Write data
+	copy(buf[offset:], data)
+	offset += dataLen
+
+	// Write delimiter
+	buf[offset] = e.Delimiter
+	offset++
+
+	// Return a copy
+	result := make([]byte, offset)
+	copy(result, buf[:offset])
 	return result, nil
 }
 
 // EncodeClose encodes a close message.
 func (e *DefaultMuxEncoder) EncodeClose(connID string) ([]byte, error) {
-	return []byte(fmt.Sprintf("CLOSE:%s%c", connID, e.Delimiter)), nil
+	offset := 0
+	copy(e.buf[offset:], "CLOSE:")
+	offset += 6
+	copy(e.buf[offset:], connID)
+	offset += len(connID)
+	e.buf[offset] = e.Delimiter
+	offset++
+
+	result := make([]byte, offset)
+	copy(result, e.buf[:offset])
+	return result, nil
 }
 
 // EncodeRequest encodes an HTTP request message.
 func (e *DefaultMuxEncoder) EncodeRequest(reqID string, data []byte) ([]byte, error) {
-	header := fmt.Sprintf("REQUEST:%s:%d:", reqID, len(data))
-	result := make([]byte, len(header)+len(data)+1)
-	copy(result, header)
-	copy(result[len(header):], data)
-	result[len(result)-1] = e.Delimiter
+	dataLen := len(data)
+	maxTotalLen := 8 + len(reqID) + 1 + 10 + 1 + dataLen + 1
+
+	buf := e.getBuffer(maxTotalLen)
+
+	offset := 0
+	copy(buf[offset:], "REQUEST:")
+	offset += 8
+	copy(buf[offset:], reqID)
+	offset += len(reqID)
+	buf[offset] = ':'
+	offset++
+	offset = writeInt(buf, offset, dataLen)
+	buf[offset] = ':'
+	offset++
+	copy(buf[offset:], data)
+	offset += dataLen
+	buf[offset] = e.Delimiter
+	offset++
+
+	result := make([]byte, offset)
+	copy(result, buf[:offset])
 	return result, nil
 }
 
 // EncodeResponse encodes an HTTP response message.
 func (e *DefaultMuxEncoder) EncodeResponse(reqID string, data []byte) ([]byte, error) {
-	header := fmt.Sprintf("RESPONSE:%s:%d:", reqID, len(data))
-	result := make([]byte, len(header)+len(data)+1)
-	copy(result, header)
-	copy(result[len(header):], data)
-	result[len(result)-1] = e.Delimiter
+	dataLen := len(data)
+	maxTotalLen := 9 + len(reqID) + 1 + 10 + 1 + dataLen + 1
+
+	buf := e.getBuffer(maxTotalLen)
+
+	offset := 0
+	copy(buf[offset:], "RESPONSE:")
+	offset += 9
+	copy(buf[offset:], reqID)
+	offset += len(reqID)
+	buf[offset] = ':'
+	offset++
+	offset = writeInt(buf, offset, dataLen)
+	buf[offset] = ':'
+	offset++
+	copy(buf[offset:], data)
+	offset += dataLen
+	buf[offset] = e.Delimiter
+	offset++
+
+	result := make([]byte, offset)
+	copy(result, buf[:offset])
 	return result, nil
 }
 
 // EncodeNewConn encodes a new connection notification.
 func (e *DefaultMuxEncoder) EncodeNewConn(connID, remoteAddr string) ([]byte, error) {
-	return []byte(fmt.Sprintf("NEWCONN:%s:%s%c", connID, remoteAddr, e.Delimiter)), nil
+	offset := 0
+	copy(e.buf[offset:], "NEWCONN:")
+	offset += 8
+	copy(e.buf[offset:], connID)
+	offset += len(connID)
+	e.buf[offset] = ':'
+	offset++
+	copy(e.buf[offset:], remoteAddr)
+	offset += len(remoteAddr)
+	e.buf[offset] = e.Delimiter
+	offset++
+
+	result := make([]byte, offset)
+	copy(result, e.buf[:offset])
+	return result, nil
 }
 
-// Release is a no-op for text protocol.
+// Release releases the encoded buffer back to pool.
+// For this implementation, it's a no-op since we use a shared buffer.
 func (e *DefaultMuxEncoder) Release(buf []byte) {}
 
 // DefaultMuxDecoder implements MuxDecoder for the text-based protocol.
