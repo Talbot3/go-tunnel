@@ -215,7 +215,7 @@ const (
 
 ### 高可用组件 (HA Components)
 
-go-tunnel 提供企业级高可用组件，支持 99.999%+ 可用性目标。
+go-tunnel 提供企业级高可用组件，支持极致可用性目标。
 
 #### 熔断器 (internal/circuit)
 
@@ -1201,16 +1201,21 @@ go-tunnel/
 
 | 包 | 覆盖率 |
 |----|--------|
-| tunnel | 70.6% |
-| forward | 47.5% |
-| internal/circuit | 100% |
-| internal/retry | 100% |
-| internal/health | 100% |
-| internal/shutdown | 100% |
-| internal/limiter | 100% |
-| internal/backpressure | 98.6% |
+| tunnel | 68.6% |
+| forward | 57.0% |
+| tcp | 100% |
+| http2 | 70.6% |
+| http3 | 26.3% |
+| quic | 29.3% |
+| internal/circuit | 80.2% |
+| internal/retry | 65.6% |
+| internal/health | 0% (待补充) |
+| internal/shutdown | 74.7% |
+| internal/limiter | 89.6% |
+| internal/backpressure | 98.5% |
 | internal/connmgr | 91.9% |
-| internal/pool | 86.2% |
+| internal/pool | 85.7% |
+| internal/metrics | 94.4% |
 
 ### 运行测试
 
@@ -1333,9 +1338,6 @@ resp, _ := httpForwarder.ForwardHTTP(ctx, reqData, muxConn, "req1", encoder, dec
 | 背压控制 | 使用 `internal/backpressure` | 防止内存溢出 |
 | TCP 优化 | 自动应用 `OptimizeTCPConn` | 降低延迟 |
 | 二进制协议 | BinaryProtocol 高效编码 | 减少内存分配 |
-    return forward.NewForwarder()
-}
-```
 
 ## 使用场景
 
