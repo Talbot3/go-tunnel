@@ -1674,3 +1674,569 @@ func TestMuxClient_TLSConfig_Nil(t *testing.T) {
 	stats := client.GetStats()
 	t.Logf("Client stats with nil TLS config: Connected=%v", stats.Connected)
 }
+
+// ============================================
+// Additional Coverage Tests
+// ============================================
+
+// TestMuxServer_HandleConnection tests handleConnection paths
+func TestMuxServer_HandleConnection_InvalidStreamType(t *testing.T) {
+	cert := generateTestCertificate(t)
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"quic-tunnel"},
+	}
+
+	server := tunnelquic.NewMuxServer(tunnelquic.MuxServerConfig{
+		ListenAddr:     "127.0.0.1:0",
+		TLSConfig:      serverTLSConfig,
+		PortRangeStart: 36000,
+		PortRangeEnd:   36100,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	serverAddr := server.Addr()
+
+	// Connect as client
+	clientTLSConfig := &tls.Config{
+		NextProtos:         []string{"quic-tunnel"},
+		InsecureSkipVerify: true,
+	}
+
+	udpAddr, _ := net.ResolveUDPAddr("udp", serverAddr.String())
+	udpConn, _ := net.ListenUDP("udp", nil)
+	defer udpConn.Close()
+
+	conn, err := quicgo.Dial(ctx, udpConn, udpAddr, clientTLSConfig, tunnelquic.DefaultConfig())
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer conn.CloseWithError(0, "done")
+
+	// Open a stream and send invalid stream type
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("Failed to open stream: %v", err)
+	}
+
+	// Send invalid stream type (0xFF)
+	_, err = stream.Write([]byte{0xFF})
+	if err != nil {
+		t.Fatalf("Failed to write: %v", err)
+	}
+
+	// Wait a bit for server to process
+	time.Sleep(100 * time.Millisecond)
+
+	// Stream should be closed by server
+	stream.Close()
+}
+
+// TestMuxServer_ControlLoop_Heartbeat tests heartbeat handling in control loop
+func TestMuxServer_ControlLoop_Heartbeat(t *testing.T) {
+	cert := generateTestCertificate(t)
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"quic-tunnel"},
+	}
+
+	server := tunnelquic.NewMuxServer(tunnelquic.MuxServerConfig{
+		ListenAddr:     "127.0.0.1:0",
+		TLSConfig:      serverTLSConfig,
+		PortRangeStart: 37000,
+		PortRangeEnd:   37100,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	serverAddr := server.Addr()
+
+	clientTLSConfig := &tls.Config{
+		NextProtos:         []string{"quic-tunnel"},
+		InsecureSkipVerify: true,
+	}
+
+	client := tunnelquic.NewMuxClient(tunnelquic.MuxClientConfig{
+		ServerAddr: serverAddr.String(),
+		TLSConfig:  clientTLSConfig,
+		LocalAddr:  "localhost:8080",
+	})
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("Failed to start client: %v", err)
+	}
+	defer client.Stop()
+
+	// Wait for connection
+	time.Sleep(200 * time.Millisecond)
+
+	stats := client.GetStats()
+	if !stats.Connected {
+		t.Fatal("Expected client to be connected")
+	}
+
+	// Wait for heartbeat to be sent
+	time.Sleep(2 * time.Second)
+
+	// Client should still be connected
+	stats = client.GetStats()
+	if !stats.Connected {
+		t.Error("Expected client to still be connected after heartbeat")
+	}
+}
+
+// TestMuxClient_HeartbeatLoop tests client heartbeat loop
+func TestMuxClient_HeartbeatLoop(t *testing.T) {
+	cert := generateTestCertificate(t)
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"quic-tunnel"},
+	}
+
+	server := tunnelquic.NewMuxServer(tunnelquic.MuxServerConfig{
+		ListenAddr:     "127.0.0.1:0",
+		TLSConfig:      serverTLSConfig,
+		PortRangeStart: 38000,
+		PortRangeEnd:   38100,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	serverAddr := server.Addr()
+
+	clientTLSConfig := &tls.Config{
+		NextProtos:         []string{"quic-tunnel"},
+		InsecureSkipVerify: true,
+	}
+
+	client := tunnelquic.NewMuxClient(tunnelquic.MuxClientConfig{
+		ServerAddr: serverAddr.String(),
+		TLSConfig:  clientTLSConfig,
+		LocalAddr:  "localhost:8080",
+	})
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("Failed to start client: %v", err)
+	}
+	defer client.Stop()
+
+	// Wait for connection
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify connection
+	stats := client.GetStats()
+	if !stats.Connected {
+		t.Fatal("Expected client to be connected")
+	}
+
+	t.Logf("Client connected with tunnel ID: %s", client.TunnelID())
+}
+
+// TestMuxClient_ControlLoop tests client control loop message handling
+func TestMuxClient_ControlLoop(t *testing.T) {
+	cert := generateTestCertificate(t)
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"quic-tunnel"},
+	}
+
+	server := tunnelquic.NewMuxServer(tunnelquic.MuxServerConfig{
+		ListenAddr:     "127.0.0.1:0",
+		TLSConfig:      serverTLSConfig,
+		PortRangeStart: 39000,
+		PortRangeEnd:   39100,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	serverAddr := server.Addr()
+
+	clientTLSConfig := &tls.Config{
+		NextProtos:         []string{"quic-tunnel"},
+		InsecureSkipVerify: true,
+	}
+
+	client := tunnelquic.NewMuxClient(tunnelquic.MuxClientConfig{
+		ServerAddr: serverAddr.String(),
+		TLSConfig:  clientTLSConfig,
+		LocalAddr:  "localhost:8080",
+	})
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("Failed to start client: %v", err)
+	}
+	defer client.Stop()
+
+	// Wait for connection
+	time.Sleep(200 * time.Millisecond)
+
+	stats := client.GetStats()
+	if !stats.Connected {
+		t.Fatal("Expected client to be connected")
+	}
+
+	// The control loop is running in background handling messages
+	t.Logf("Client control loop running, tunnel ID: %s", client.TunnelID())
+}
+
+// TestMuxServer_HealthCheck tests health check functionality
+func TestMuxServer_HealthCheck(t *testing.T) {
+	cert := generateTestCertificate(t)
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"quic-tunnel"},
+	}
+
+	server := tunnelquic.NewMuxServer(tunnelquic.MuxServerConfig{
+		ListenAddr:     "127.0.0.1:0",
+		TLSConfig:      serverTLSConfig,
+		PortRangeStart: 40000,
+		PortRangeEnd:   40100,
+		TunnelTimeout:  1 * time.Second, // Short timeout for testing
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	// Server should be running
+	time.Sleep(100 * time.Millisecond)
+
+	stats := server.GetStats()
+	t.Logf("Server stats: ActiveTunnels=%d", stats.ActiveTunnels)
+}
+
+// TestMuxClient_Stop_Connected tests stopping a connected client
+func TestMuxClient_Stop_Connected(t *testing.T) {
+	cert := generateTestCertificate(t)
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"quic-tunnel"},
+	}
+
+	server := tunnelquic.NewMuxServer(tunnelquic.MuxServerConfig{
+		ListenAddr:     "127.0.0.1:0",
+		TLSConfig:      serverTLSConfig,
+		PortRangeStart: 41000,
+		PortRangeEnd:   41100,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	serverAddr := server.Addr()
+
+	clientTLSConfig := &tls.Config{
+		NextProtos:         []string{"quic-tunnel"},
+		InsecureSkipVerify: true,
+	}
+
+	client := tunnelquic.NewMuxClient(tunnelquic.MuxClientConfig{
+		ServerAddr: serverAddr.String(),
+		TLSConfig:  clientTLSConfig,
+		LocalAddr:  "localhost:8080",
+	})
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("Failed to start client: %v", err)
+	}
+
+	// Wait for connection
+	time.Sleep(100 * time.Millisecond)
+
+	stats := client.GetStats()
+	if !stats.Connected {
+		t.Fatal("Expected client to be connected")
+	}
+
+	// Stop the client
+	client.Stop()
+
+	// Verify client is stopped
+	time.Sleep(100 * time.Millisecond)
+
+	stats = client.GetStats()
+	if stats.Connected {
+		t.Error("Expected client to be disconnected after stop")
+	}
+}
+
+// TestMuxServer_CloseTunnel tests tunnel closure
+func TestMuxServer_CloseTunnel(t *testing.T) {
+	cert := generateTestCertificate(t)
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"quic-tunnel"},
+	}
+
+	server := tunnelquic.NewMuxServer(tunnelquic.MuxServerConfig{
+		ListenAddr:     "127.0.0.1:0",
+		TLSConfig:      serverTLSConfig,
+		PortRangeStart: 42000,
+		PortRangeEnd:   42100,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	serverAddr := server.Addr()
+
+	clientTLSConfig := &tls.Config{
+		NextProtos:         []string{"quic-tunnel"},
+		InsecureSkipVerify: true,
+	}
+
+	client := tunnelquic.NewMuxClient(tunnelquic.MuxClientConfig{
+		ServerAddr: serverAddr.String(),
+		TLSConfig:  clientTLSConfig,
+		LocalAddr:  "localhost:8080",
+	})
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("Failed to start client: %v", err)
+	}
+
+	// Wait for connection
+	time.Sleep(100 * time.Millisecond)
+
+	// Get initial stats
+	serverStats := server.GetStats()
+	initialTunnels := serverStats.ActiveTunnels
+
+	// Stop client (this will close the tunnel)
+	client.Stop()
+
+	// Wait for tunnel to close
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify tunnel is closed
+	serverStats = server.GetStats()
+	if serverStats.ActiveTunnels >= initialTunnels {
+		t.Error("Expected tunnel count to decrease after client stop")
+	}
+}
+
+// TestMuxClient_HandleNewConn_TCP tests handleNewConn for TCP
+func TestMuxClient_HandleNewConn_TCP(t *testing.T) {
+	cert := generateTestCertificate(t)
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"quic-tunnel"},
+	}
+
+	// Start local TCP server
+	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to start TCP server: %v", err)
+	}
+	defer tcpListener.Close()
+
+	tcpAddr := tcpListener.Addr().String()
+	go func() {
+		for {
+			conn, err := tcpListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					c.Write(buf[:n])
+				}
+			}(conn)
+		}
+	}()
+
+	server := tunnelquic.NewMuxServer(tunnelquic.MuxServerConfig{
+		ListenAddr:     "127.0.0.1:0",
+		TLSConfig:      serverTLSConfig,
+		PortRangeStart: 43000,
+		PortRangeEnd:   43100,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	serverAddr := server.Addr()
+
+	clientTLSConfig := &tls.Config{
+		NextProtos:         []string{"quic-tunnel"},
+		InsecureSkipVerify: true,
+	}
+
+	client := tunnelquic.NewMuxClient(tunnelquic.MuxClientConfig{
+		ServerAddr: serverAddr.String(),
+		TLSConfig:  clientTLSConfig,
+		Protocol:   tunnelquic.ProtocolTCP,
+		LocalAddr:  tcpAddr,
+	})
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("Failed to start client: %v", err)
+	}
+	defer client.Stop()
+
+	// Wait for connection
+	time.Sleep(200 * time.Millisecond)
+
+	stats := client.GetStats()
+	if !stats.Connected {
+		t.Fatal("Expected client to be connected")
+	}
+
+	t.Logf("TCP client connected, public URL: %s", client.PublicURL())
+}
+
+// TestMuxClient_HandleNewConn_InvalidLocalAddr tests handleNewConn with invalid local address
+func TestMuxClient_HandleNewConn_InvalidLocalAddr(t *testing.T) {
+	cert := generateTestCertificate(t)
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"quic-tunnel"},
+	}
+
+	server := tunnelquic.NewMuxServer(tunnelquic.MuxServerConfig{
+		ListenAddr:     "127.0.0.1:0",
+		TLSConfig:      serverTLSConfig,
+		PortRangeStart: 44000,
+		PortRangeEnd:   44100,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	serverAddr := server.Addr()
+
+	clientTLSConfig := &tls.Config{
+		NextProtos:         []string{"quic-tunnel"},
+		InsecureSkipVerify: true,
+	}
+
+	// Use an invalid local address that won't accept connections
+	client := tunnelquic.NewMuxClient(tunnelquic.MuxClientConfig{
+		ServerAddr: serverAddr.String(),
+		TLSConfig:  clientTLSConfig,
+		Protocol:   tunnelquic.ProtocolTCP,
+		LocalAddr:  "10.255.255.1:9999", // Invalid address
+	})
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("Failed to start client: %v", err)
+	}
+	defer client.Stop()
+
+	// Wait for connection
+	time.Sleep(200 * time.Millisecond)
+
+	// Client should be connected to server even with invalid local address
+	// (the local address is only used when external connections arrive)
+	stats := client.GetStats()
+	t.Logf("Client stats with invalid local addr: Connected=%v", stats.Connected)
+}
+
+// TestMuxServer_AcceptDataStreams tests acceptDataStreams
+func TestMuxServer_AcceptDataStreams(t *testing.T) {
+	cert := generateTestCertificate(t)
+	serverTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"quic-tunnel"},
+	}
+
+	server := tunnelquic.NewMuxServer(tunnelquic.MuxServerConfig{
+		ListenAddr:     "127.0.0.1:0",
+		TLSConfig:      serverTLSConfig,
+		PortRangeStart: 45000,
+		PortRangeEnd:   45100,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	serverAddr := server.Addr()
+
+	clientTLSConfig := &tls.Config{
+		NextProtos:         []string{"quic-tunnel"},
+		InsecureSkipVerify: true,
+	}
+
+	client := tunnelquic.NewMuxClient(tunnelquic.MuxClientConfig{
+		ServerAddr: serverAddr.String(),
+		TLSConfig:  clientTLSConfig,
+		LocalAddr:  "localhost:8080",
+	})
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("Failed to start client: %v", err)
+	}
+	defer client.Stop()
+
+	// Wait for connection
+	time.Sleep(200 * time.Millisecond)
+
+	stats := client.GetStats()
+	if !stats.Connected {
+		t.Fatal("Expected client to be connected")
+	}
+
+	// The acceptDataStreams is running in background
+	t.Logf("Server acceptDataStreams running for tunnel: %s", client.TunnelID())
+}

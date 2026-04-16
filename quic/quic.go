@@ -1286,6 +1286,8 @@ func (s *MuxClient) Stop() error {
 		s.cancel()
 	}
 
+	s.connected.Store(false)
+
 	s.connMu.Lock()
 	if s.conn != nil {
 		s.conn.CloseWithError(0, "client stopped")
