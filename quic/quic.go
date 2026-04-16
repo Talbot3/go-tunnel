@@ -86,14 +86,127 @@ const (
 	MsgTypeCloseConn   byte = 0x06 // Connection close
 	MsgTypeError       byte = 0x07 // Error message
 	MsgTypeData        byte = 0x08 // Data message (for single-stream mode)
+	MsgTypeConfigUpdate byte = 0x09 // Dynamic configuration update
+	MsgTypeConfigAck   byte = 0x0A // Configuration update acknowledgment
 )
+
+// DATAGRAM message types (RFC 9221)
+const (
+	DgramTypeHeartbeat      byte = 0x01 // DATAGRAM heartbeat
+	DgramTypeHeartbeatAck   byte = 0x02 // DATAGRAM heartbeat response
+	DgramTypeNetworkQuality byte = 0x03 // Network quality report
+)
+
+// DATAGRAM message sizes
+const (
+	DgramHeartbeatSize = 1 + 4 + 4 // type + timestamp + lastRTT
+	DgramMaxSize       = 1200      // Safe MTU for DATAGRAM frames
+)
+
+// Enhanced heartbeat sizes
+const (
+	HeartbeatSize = 1 + 4 + 4 + 8 + 8 + 2 // type + timestamp + rtt + bytesIn + bytesOut + lossRate
+)
+
+// NetworkQuality represents network quality metrics
+type NetworkQuality struct {
+	RTT        time.Duration // Round-trip time
+	BytesIn    int64         // Bytes received
+	BytesOut   int64         // Bytes sent
+	LossRate   uint16        // Packet loss rate (0-10000, representing 0.00%-100.00%)
+	Timestamp  time.Time     // Measurement timestamp
+}
 
 // Protocol types
 const (
-	ProtocolTCP  byte = 0x01
-	ProtocolHTTP byte = 0x02
-	ProtocolQUIC byte = 0x03 // Pure QUIC tunnel - both entry and backend use QUIC
+	ProtocolTCP   byte = 0x01
+	ProtocolHTTP  byte = 0x02
+	ProtocolQUIC  byte = 0x03 // Pure QUIC tunnel - both entry and backend use QUIC
+	ProtocolHTTP2 byte = 0x04 // HTTP/2 with stream mapping optimization
+	ProtocolHTTP3 byte = 0x05 // HTTP/3 with stream mapping optimization
 )
+
+// Session header flags
+const (
+	FlagKeepAlive     byte = 0x01 // Keep connection alive
+	FlagHTTP2FrameMap byte = 0x04 // HTTP/2 stream mapping optimization
+)
+
+// SessionHeader represents the unified session header for data streams
+// Format: [1B ProtoType][2B TargetLen][Target][1B Flags][4B ConnID]
+type SessionHeader struct {
+	Protocol byte   // Protocol type
+	Target   string // Target address (e.g., "127.0.0.1:8080")
+	Flags    byte   // Session flags
+	ConnID   string // Connection ID
+}
+
+// Encode encodes the session header to bytes
+// Format: [1B ProtoType][2B TargetLen][Target][1B Flags][2B ConnIDLen][ConnID]
+func (h *SessionHeader) Encode() []byte {
+	targetBytes := []byte(h.Target)
+	connIDBytes := []byte(h.ConnID)
+
+	// Total length: 1 + 2 + len(target) + 1 + 2 + len(connID)
+	totalLen := 1 + 2 + len(targetBytes) + 1 + 2 + len(connIDBytes)
+	buf := make([]byte, totalLen)
+
+	offset := 0
+	buf[offset] = h.Protocol
+	offset++
+
+	binary.BigEndian.PutUint16(buf[offset:], uint16(len(targetBytes)))
+	offset += 2
+	copy(buf[offset:], targetBytes)
+	offset += len(targetBytes)
+
+	buf[offset] = h.Flags
+	offset++
+
+	binary.BigEndian.PutUint16(buf[offset:], uint16(len(connIDBytes)))
+	offset += 2
+	copy(buf[offset:], connIDBytes)
+
+	return buf
+}
+
+// DecodeSessionHeader decodes a session header from bytes
+func DecodeSessionHeader(data []byte) (*SessionHeader, int, error) {
+	if len(data) < 6 { // Minimum: 1 + 2 + 0 + 1 + 2
+		return nil, 0, errors.New("session header too short")
+	}
+
+	offset := 0
+	header := &SessionHeader{}
+
+	header.Protocol = data[offset]
+	offset++
+
+	targetLen := binary.BigEndian.Uint16(data[offset:])
+	offset += 2
+
+	if len(data) < offset+int(targetLen)+3 {
+		return nil, 0, errors.New("session header truncated (target)")
+	}
+
+	header.Target = string(data[offset : offset+int(targetLen)])
+	offset += int(targetLen)
+
+	header.Flags = data[offset]
+	offset++
+
+	connIDLen := binary.BigEndian.Uint16(data[offset:])
+	offset += 2
+
+	if len(data) < offset+int(connIDLen) {
+		return nil, 0, errors.New("session header truncated (connID)")
+	}
+
+	header.ConnID = string(data[offset : offset+int(connIDLen)])
+	offset += int(connIDLen)
+
+	return header, offset, nil
+}
 
 // Default intervals and sizes
 const (
@@ -521,6 +634,10 @@ func (s *MuxServer) handleControlStream(conn quic.Connection, stream quic.Stream
 	s.wg.Add(1)
 	go s.acceptDataStreams(tunnel)
 
+	// Start DATAGRAM handler for lightweight signaling
+	s.wg.Add(1)
+	go s.handleDatagram(tunnel.Conn, tunnel)
+
 	// Control message loop
 	s.controlLoop(tunnel)
 }
@@ -573,6 +690,10 @@ func (s *MuxServer) controlLoop(tunnel *Tunnel) {
 				conn.(net.Conn).Close()
 				s.activeConns.Add(-1)
 			}
+
+		case MsgTypeConfigAck:
+			// Configuration update acknowledged by client
+			log.Printf("[MuxServer] Config update acknowledged for tunnel %s", tunnel.ID)
 		}
 	}
 }
@@ -599,6 +720,7 @@ func (s *MuxServer) acceptDataStreams(tunnel *Tunnel) {
 }
 
 // handleDataStream handles a data stream
+// Supports both legacy format [StreamType][connIDLen][connID] and new format [StreamType][SessionHeader]
 func (s *MuxServer) handleDataStream(tunnel *Tunnel, stream quic.Stream) {
 	defer s.wg.Done()
 	defer stream.Close()
@@ -613,19 +735,83 @@ func (s *MuxServer) handleDataStream(tunnel *Tunnel, stream quic.Stream) {
 		return
 	}
 
-	// Read connID length
-	var connIDLenBuf [2]byte
-	if _, err := io.ReadFull(stream, connIDLenBuf[:]); err != nil {
+	// Read the next byte to determine format
+	var nextByte [1]byte
+	if _, err := io.ReadFull(stream, nextByte[:]); err != nil {
 		return
 	}
 
-	connIDLen := binary.BigEndian.Uint16(connIDLenBuf[:])
-	connID := make([]byte, connIDLen)
-	if _, err := io.ReadFull(stream, connID); err != nil {
-		return
+	var connIDStr string
+	var targetOverride string
+
+	// Check if this is a protocol type (new format) or connID length high byte (legacy format)
+	// Protocol types are 0x01-0x05, connID length high byte would be 0x00 for short connIDs
+	// For backward compatibility, we check if the byte is a valid protocol type
+	if nextByte[0] >= ProtocolTCP && nextByte[0] <= ProtocolHTTP3 {
+		// New format: read remaining session header
+		// We already read Protocol byte, now read TargetLen
+		var targetLenBuf [2]byte
+		if _, err := io.ReadFull(stream, targetLenBuf[:]); err != nil {
+			return
+		}
+		targetLen := binary.BigEndian.Uint16(targetLenBuf[:])
+
+		// Read target
+		if targetLen > 0 {
+			targetBytes := make([]byte, targetLen)
+			if _, err := io.ReadFull(stream, targetBytes); err != nil {
+				return
+			}
+			targetOverride = string(targetBytes)
+		}
+
+		// Read flags
+		var flagsBuf [1]byte
+		if _, err := io.ReadFull(stream, flagsBuf[:]); err != nil {
+			return
+		}
+		_ = flagsBuf[0] // Flags can be used for protocol-specific optimizations
+
+		// Read connID length
+		var connIDLenBuf [2]byte
+		if _, err := io.ReadFull(stream, connIDLenBuf[:]); err != nil {
+			return
+		}
+		connIDLen := binary.BigEndian.Uint16(connIDLenBuf[:])
+
+		// Read connID
+		if connIDLen > 0 {
+			connID := make([]byte, connIDLen)
+			if _, err := io.ReadFull(stream, connID); err != nil {
+				return
+			}
+			connIDStr = string(connID)
+		}
+	} else {
+		// Legacy format: nextByte is the high byte of connID length
+		// Read low byte of connID length
+		var connIDLenLowBuf [1]byte
+		if _, err := io.ReadFull(stream, connIDLenLowBuf[:]); err != nil {
+			return
+		}
+		connIDLen := uint16(nextByte[0])<<8 | uint16(connIDLenLowBuf[0])
+
+		// Read connID
+		if connIDLen > 0 {
+			connID := make([]byte, connIDLen)
+			if _, err := io.ReadFull(stream, connID); err != nil {
+				return
+			}
+			connIDStr = string(connID)
+		}
 	}
 
-	connIDStr := string(connID)
+	// Determine target address
+	targetAddr := tunnel.LocalAddr
+	if targetOverride != "" {
+		targetAddr = targetOverride
+	}
+	_ = targetAddr // Use for dynamic routing in future
 
 	// Find external connection
 	extConn, ok := tunnel.ExternalConns.Load(connIDStr)
@@ -805,6 +991,7 @@ func (s *MuxServer) handleExternalQUICConnection(tunnel *Tunnel, extConn quic.Co
 }
 
 // forwardQUICStream forwards a QUIC stream through the tunnel
+// Uses new session header format with protocol type and target address
 func (s *MuxServer) forwardQUICStream(tunnel *Tunnel, extStream quic.Stream, connID string) {
 	defer s.wg.Done()
 	defer extStream.Close()
@@ -817,14 +1004,21 @@ func (s *MuxServer) forwardQUICStream(tunnel *Tunnel, extStream quic.Stream, con
 	}
 	defer dataStream.Close()
 
-	// Write stream type and connection ID
-	header := make([]byte, 3+len(connID))
-	header[0] = StreamTypeData
-	binary.BigEndian.PutUint16(header[1:3], uint16(len(connID)))
-	copy(header[3:], connID)
+	// Write stream type
+	if _, err := dataStream.Write([]byte{StreamTypeData}); err != nil {
+		log.Printf("[MuxServer] Write stream type failed: %v", err)
+		return
+	}
 
-	if _, err := dataStream.Write(header); err != nil {
-		log.Printf("[MuxServer] Write stream header failed: %v", err)
+	// Write session header (new format)
+	header := &SessionHeader{
+		Protocol: tunnel.Protocol,
+		Target:   tunnel.LocalAddr,
+		Flags:    0,
+		ConnID:   connID,
+	}
+	if _, err := dataStream.Write(header.Encode()); err != nil {
+		log.Printf("[MuxServer] Write session header failed: %v", err)
 		return
 	}
 
@@ -927,7 +1121,7 @@ func (s *MuxServer) forwardExternalToControl(tunnel *Tunnel, extConn net.Conn, c
 		s.activeConns.Add(-1)
 
 		// Send close message
-		closeMsg := buildCloseConnMessage(connID)
+		closeMsg := BuildCloseConnMessage(connID)
 		if _, writeErr := tunnel.ControlStream.Write(closeMsg); writeErr != nil {
 			log.Printf("[MuxServer] Write CLOSE failed: %v", writeErr)
 		}
@@ -1106,6 +1300,109 @@ func (s *MuxServer) healthCheck() {
 	}
 }
 
+// handleDatagram handles incoming DATAGRAM messages from a QUIC connection
+// DATAGRAM is used for lightweight signaling (heartbeat, network quality)
+func (s *MuxServer) handleDatagram(conn quic.Connection, tunnel *Tunnel) {
+	defer s.wg.Done()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-tunnel.ctx.Done():
+			return
+		default:
+		}
+
+		data, err := conn.ReceiveDatagram(s.ctx)
+		if err != nil {
+			if s.ctx.Err() != nil || tunnel.ctx.Err() != nil {
+				return
+			}
+			log.Printf("[MuxServer] Receive DATAGRAM error: %v", err)
+			continue
+		}
+
+		if len(data) < 1 {
+			continue
+		}
+
+		dgramType := data[0]
+		switch dgramType {
+		case DgramTypeHeartbeat:
+			s.handleDatagramHeartbeat(conn, data, tunnel)
+		default:
+			log.Printf("[MuxServer] Unknown DATAGRAM type: %d", dgramType)
+		}
+	}
+}
+
+// handleDatagramHeartbeat handles DATAGRAM heartbeat message
+// Format: [1B type][4B timestamp][4B lastRTT]
+func (s *MuxServer) handleDatagramHeartbeat(conn quic.Connection, data []byte, tunnel *Tunnel) {
+	if len(data) < 9 {
+		return
+	}
+
+	// Parse client timestamp to calculate RTT
+	clientTimestamp := binary.BigEndian.Uint32(data[1:5])
+	now := uint32(time.Now().UnixNano() / int64(time.Millisecond))
+	rtt := now - clientTimestamp
+
+	// Update tunnel activity
+	tunnel.LastActive.Store(time.Now().Unix())
+
+	// Send heartbeat ack with server metrics
+	ack := make([]byte, DgramHeartbeatSize)
+	ack[0] = DgramTypeHeartbeatAck
+	binary.BigEndian.PutUint32(ack[1:5], now)
+	binary.BigEndian.PutUint32(ack[5:9], rtt)
+
+	if err := conn.SendDatagram(ack); err != nil {
+		log.Printf("[MuxServer] Send DATAGRAM heartbeat ack failed: %v", err)
+	}
+}
+
+// SendEnhancedHeartbeat sends an enhanced heartbeat with network quality metrics
+// Format: [1B type][4B timestamp][4B rtt][8B bytesIn][8B bytesOut][2B lossRate]
+func (s *MuxServer) SendEnhancedHeartbeat(tunnelID string) error {
+	value, ok := s.tunnels.Load(tunnelID)
+	if !ok {
+		return ErrTunnelNotFound
+	}
+	tunnel := value.(*Tunnel)
+
+	heartbeat := make([]byte, HeartbeatSize)
+	heartbeat[0] = MsgTypeHeartbeat
+
+	now := uint32(time.Now().UnixNano() / int64(time.Millisecond))
+	binary.BigEndian.PutUint32(heartbeat[1:5], now)
+	binary.BigEndian.PutUint32(heartbeat[5:9], 0) // RTT placeholder
+	binary.BigEndian.PutUint64(heartbeat[9:17], uint64(s.bytesIn.Load()))
+	binary.BigEndian.PutUint64(heartbeat[17:25], uint64(s.bytesOut.Load()))
+	binary.BigEndian.PutUint16(heartbeat[25:27], 0) // Loss rate placeholder
+
+	_, err := tunnel.ControlStream.Write(heartbeat)
+	return err
+}
+
+// GetNetworkQuality returns network quality metrics for a tunnel
+func (s *MuxServer) GetNetworkQuality(tunnelID string) (*NetworkQuality, error) {
+	value, ok := s.tunnels.Load(tunnelID)
+	if !ok {
+		return nil, ErrTunnelNotFound
+	}
+	tunnel := value.(*Tunnel)
+
+	return &NetworkQuality{
+		RTT:       0, // Would need to track this
+		BytesIn:   s.bytesIn.Load(),
+		BytesOut:  s.bytesOut.Load(),
+		LossRate:  0, // Would need QUIC stats
+		Timestamp: time.Unix(tunnel.LastActive.Load(), 0),
+	}, nil
+}
+
 // GetStats returns server statistics
 func (s *MuxServer) GetStats() ServerStats {
 	return ServerStats{
@@ -1150,6 +1447,39 @@ func (s *MuxServer) Forwarder() forward.Forwarder {
 	return forward.NewForwarder()
 }
 
+// SendConfigUpdate sends a configuration update to a specific tunnel
+// Format: [1B MsgTypeConfigUpdate][2B ConfigLen][ConfigJSON]
+func (s *MuxServer) SendConfigUpdate(tunnelID string, configJSON []byte) error {
+	value, ok := s.tunnels.Load(tunnelID)
+	if !ok {
+		return ErrTunnelNotFound
+	}
+	tunnel := value.(*Tunnel)
+
+	// Build config update message
+	msg := make([]byte, 1+2+len(configJSON))
+	msg[0] = MsgTypeConfigUpdate
+	binary.BigEndian.PutUint16(msg[1:3], uint16(len(configJSON)))
+	copy(msg[3:], configJSON)
+
+	_, err := tunnel.ControlStream.Write(msg)
+	return err
+}
+
+// BroadcastConfigUpdate sends a configuration update to all tunnels
+func (s *MuxServer) BroadcastConfigUpdate(configJSON []byte) error {
+	var lastErr error
+	s.tunnels.Range(func(key, value interface{}) bool {
+		tunnel := value.(*Tunnel)
+		if err := s.SendConfigUpdate(tunnel.ID, configJSON); err != nil {
+			lastErr = err
+			log.Printf("[MuxServer] Failed to send config update to tunnel %s: %v", tunnel.ID, err)
+		}
+		return true
+	})
+	return lastErr
+}
+
 // ServerStats server statistics
 type ServerStats struct {
 	ActiveTunnels int64
@@ -1186,14 +1516,29 @@ type MuxClientConfig struct {
 	// Reconnect
 	ReconnectInterval time.Duration
 	MaxReconnectTries int // 0 = infinite
+
+	// 0-RTT Support
+	Enable0RTT      bool          // Enable 0-RTT fast reconnection
+	SessionCache    tls.ClientSessionCache // TLS session cache for 0-RTT
 }
 
-// DefaultMuxClientConfig returns default client config
+// TunnelState represents cached tunnel state for 0-RTT recovery
+type TunnelState struct {
+	TunnelID   string
+	Protocol   byte
+	LocalAddr  string
+	PublicURL  string
+	SavedAt    time.Time
+}
+
+// DefaultMuxClientConfig returns default client config with 0-RTT support
 func DefaultMuxClientConfig() MuxClientConfig {
 	return MuxClientConfig{
 		Protocol:          ProtocolTCP,
 		QUICConfig:        DefaultConfig(),
 		ReconnectInterval: 5 * time.Second,
+		Enable0RTT:        true,
+		SessionCache:      tls.NewLRUClientSessionCache(100),
 	}
 }
 
@@ -1378,7 +1723,7 @@ func (s *MuxClient) connect() error {
 		return fmt.Errorf("listen UDP failed: %w", err)
 	}
 
-	// 3. Dial QUIC
+	// 3. Configure TLS for 0-RTT support
 	tlsConf := s.config.TLSConfig
 	if tlsConf == nil {
 		tlsConf = &tls.Config{
@@ -1390,6 +1735,11 @@ func (s *MuxClient) connect() error {
 	}
 	if len(tlsConf.NextProtos) == 0 {
 		tlsConf.NextProtos = []string{"quic-tunnel"}
+	}
+
+	// Enable TLS session cache for 0-RTT
+	if s.config.Enable0RTT && s.config.SessionCache != nil {
+		tlsConf.ClientSessionCache = s.config.SessionCache
 	}
 
 	conn, err := quic.Dial(s.ctx, udpConn, udpAddr, tlsConf, s.config.QUICConfig)
@@ -1438,11 +1788,17 @@ func (s *MuxClient) connect() error {
 	s.wg.Add(1)
 	go s.heartbeatLoop()
 
-	// 9. Start control message loop
+	// 9. Start DATAGRAM receive loop if supported
+	if s.conn.ConnectionState().SupportsDatagrams {
+		s.wg.Add(1)
+		go s.datagramReceiveLoop()
+	}
+
+	// 10. Start control message loop
 	s.wg.Add(1)
 	go s.controlLoop()
 
-	// 10. For QUIC tunnel, start data stream acceptor
+	// 11. For QUIC tunnel, start data stream acceptor
 	if s.config.Protocol == ProtocolQUIC {
 		s.wg.Add(1)
 		go s.acceptQUICDataStreams()
@@ -1502,7 +1858,7 @@ func (s *MuxClient) readRegisterAck() error {
 	return nil
 }
 
-// heartbeatLoop sends heartbeats
+// heartbeatLoop sends heartbeats using DATAGRAM for lower latency
 func (s *MuxClient) heartbeatLoop() {
 	defer s.wg.Done()
 
@@ -1518,12 +1874,71 @@ func (s *MuxClient) heartbeatLoop() {
 				return
 			}
 
-			heartbeat := []byte{MsgTypeHeartbeat}
-			if _, err := s.controlStream.Write(heartbeat); err != nil {
-				log.Printf("[MuxClient] Heartbeat failed: %v", err)
-				s.triggerReconnect()
+			// Try DATAGRAM heartbeat first (lower latency)
+			if s.conn.ConnectionState().SupportsDatagrams {
+				now := time.Now().UnixNano() / int64(time.Millisecond)
+				heartbeat := make([]byte, DgramHeartbeatSize)
+				heartbeat[0] = DgramTypeHeartbeat
+				binary.BigEndian.PutUint32(heartbeat[1:5], uint32(now))
+				binary.BigEndian.PutUint32(heartbeat[5:9], 0) // Last RTT placeholder
+
+				if err := s.conn.SendDatagram(heartbeat); err != nil {
+					// Fall back to stream heartbeat if DATAGRAM fails
+					s.sendStreamHeartbeat()
+				}
+			} else {
+				// Use stream heartbeat if DATAGRAM not supported
+				s.sendStreamHeartbeat()
+			}
+		}
+	}
+}
+
+// sendStreamHeartbeat sends heartbeat via control stream
+func (s *MuxClient) sendStreamHeartbeat() {
+	heartbeat := []byte{MsgTypeHeartbeat}
+	if _, err := s.controlStream.Write(heartbeat); err != nil {
+		log.Printf("[MuxClient] Heartbeat failed: %v", err)
+		s.triggerReconnect()
+	}
+}
+
+// datagramReceiveLoop receives DATAGRAM messages from server
+func (s *MuxClient) datagramReceiveLoop() {
+	defer s.wg.Done()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		if !s.connected.Load() {
+			return
+		}
+
+		data, err := s.conn.ReceiveDatagram(s.ctx)
+		if err != nil {
+			if s.ctx.Err() != nil {
 				return
 			}
+			continue
+		}
+
+		if len(data) < 1 {
+			continue
+		}
+
+		dgramType := data[0]
+		switch dgramType {
+		case DgramTypeHeartbeatAck:
+			// DATAGRAM heartbeat ack received
+			// Could calculate RTT here if needed
+		case DgramTypeNetworkQuality:
+			// Network quality report from server
+		default:
+			// Unknown DATAGRAM type
 		}
 	}
 }
@@ -1573,6 +1988,10 @@ func (s *MuxClient) controlLoop() {
 		case MsgTypeData:
 			// Handle data from server
 			s.handleData(msg.Payload)
+
+		case MsgTypeConfigUpdate:
+			// Handle configuration update from server
+			s.handleConfigUpdate(msg.Payload)
 		}
 	}
 }
@@ -1604,7 +2023,7 @@ func (s *MuxClient) handleNewConn(payload []byte) {
 		if err != nil {
 			log.Printf("[MuxClient] Connect local failed: %v", err)
 			// Send close message
-			closeMsg := buildCloseConnMessage(connID)
+			closeMsg := BuildCloseConnMessage(connID)
 			s.controlStream.Write(closeMsg)
 			return
 		}
@@ -1659,6 +2078,7 @@ func (s *MuxClient) acceptQUICDataStreams() {
 }
 
 // handleQUICDataStream handles a data stream for QUIC tunnel
+// Supports both legacy format and new session header format
 func (s *MuxClient) handleQUICDataStream(stream quic.Stream) {
 	defer s.wg.Done()
 	defer stream.Close()
@@ -1673,27 +2093,85 @@ func (s *MuxClient) handleQUICDataStream(stream quic.Stream) {
 		return
 	}
 
-	// Read connID length
-	var connIDLenBuf [2]byte
-	if _, err := io.ReadFull(stream, connIDLenBuf[:]); err != nil {
+	// Read the next byte to determine format
+	var nextByte [1]byte
+	if _, err := io.ReadFull(stream, nextByte[:]); err != nil {
 		return
 	}
 
-	connIDLen := binary.BigEndian.Uint16(connIDLenBuf[:])
-	connID := make([]byte, connIDLen)
-	if _, err := io.ReadFull(stream, connID); err != nil {
-		return
+	var connIDStr string
+	var targetOverride string
+
+	// Check if this is a protocol type (new format) or connID length high byte (legacy format)
+	if nextByte[0] >= ProtocolTCP && nextByte[0] <= ProtocolHTTP3 {
+		// New format: read remaining session header
+		var targetLenBuf [2]byte
+		if _, err := io.ReadFull(stream, targetLenBuf[:]); err != nil {
+			return
+		}
+		targetLen := binary.BigEndian.Uint16(targetLenBuf[:])
+
+		// Read target
+		if targetLen > 0 {
+			targetBytes := make([]byte, targetLen)
+			if _, err := io.ReadFull(stream, targetBytes); err != nil {
+				return
+			}
+			targetOverride = string(targetBytes)
+		}
+
+		// Read flags
+		var flagsBuf [1]byte
+		if _, err := io.ReadFull(stream, flagsBuf[:]); err != nil {
+			return
+		}
+		_ = flagsBuf[0]
+
+		// Read connID length
+		var connIDLenBuf [2]byte
+		if _, err := io.ReadFull(stream, connIDLenBuf[:]); err != nil {
+			return
+		}
+		connIDLen := binary.BigEndian.Uint16(connIDLenBuf[:])
+
+		// Read connID
+		if connIDLen > 0 {
+			connID := make([]byte, connIDLen)
+			if _, err := io.ReadFull(stream, connID); err != nil {
+				return
+			}
+			connIDStr = string(connID)
+		}
+	} else {
+		// Legacy format
+		var connIDLenLowBuf [1]byte
+		if _, err := io.ReadFull(stream, connIDLenLowBuf[:]); err != nil {
+			return
+		}
+		connIDLen := uint16(nextByte[0])<<8 | uint16(connIDLenLowBuf[0])
+
+		if connIDLen > 0 {
+			connID := make([]byte, connIDLen)
+			if _, err := io.ReadFull(stream, connID); err != nil {
+				return
+			}
+			connIDStr = string(connID)
+		}
 	}
 
-	connIDStr := string(connID)
+	// Determine target address
+	targetAddr := s.config.LocalAddr
+	if targetOverride != "" {
+		targetAddr = targetOverride
+	}
 
 	// Dial local QUIC service if not already connected
 	var localConn quic.Connection
 	if stored, ok := s.localQUICConns.Load(connIDStr); ok {
 		localConn = stored.(quic.Connection)
 	} else {
-		// Dial local QUIC service
-		udpAddr, err := net.ResolveUDPAddr("udp", s.config.LocalAddr)
+		// Dial local QUIC service using targetAddr (supports dynamic routing)
+		udpAddr, err := net.ResolveUDPAddr("udp", targetAddr)
 		if err != nil {
 			log.Printf("[MuxClient] Resolve local QUIC address failed: %v", err)
 			return
@@ -1840,6 +2318,28 @@ func (s *MuxClient) handleData(payload []byte) {
 	}
 }
 
+// handleConfigUpdate handles configuration update from server
+// Format: [2B ConfigLen][ConfigJSON]
+func (s *MuxClient) handleConfigUpdate(payload []byte) {
+	if len(payload) < 2 {
+		return
+	}
+
+	configLen := binary.BigEndian.Uint16(payload[:2])
+	if len(payload) < 2+int(configLen) {
+		return
+	}
+
+	configJSON := payload[2 : 2+int(configLen)]
+	log.Printf("[MuxClient] Received config update: %s", string(configJSON))
+
+	// Send acknowledgment
+	ack := []byte{MsgTypeConfigAck}
+	if _, err := s.controlStream.Write(ack); err != nil {
+		log.Printf("[MuxClient] Failed to send config ack: %v", err)
+	}
+}
+
 // forwardLocalToControl forwards local connection to control stream
 func (s *MuxClient) forwardLocalToControl(localConn net.Conn, connID string) {
 	defer s.wg.Done()
@@ -1850,7 +2350,7 @@ func (s *MuxClient) forwardLocalToControl(localConn net.Conn, connID string) {
 
 		// Only send close message if context is still valid and connected
 		if s.ctx.Err() == nil && s.connected.Load() {
-			closeMsg := buildCloseConnMessage(connID)
+			closeMsg := BuildCloseConnMessage(connID)
 			if _, err := s.controlStream.Write(closeMsg); err != nil {
 				log.Printf("[MuxClient] Write CLOSE failed: %v", err)
 			}
@@ -1925,6 +2425,27 @@ type ClientStats struct {
 	TotalConns  int64
 	BytesIn     int64
 	BytesOut    int64
+}
+
+// SaveTunnelState returns the current tunnel state for caching
+func (s *MuxClient) SaveTunnelState() *TunnelState {
+	return &TunnelState{
+		TunnelID:  s.tunnelID,
+		Protocol:  s.config.Protocol,
+		LocalAddr: s.config.LocalAddr,
+		PublicURL: s.publicURL,
+		SavedAt:   time.Now(),
+	}
+}
+
+// RestoreFromState restores tunnel configuration from cached state
+func (s *MuxClient) RestoreFromState(state *TunnelState) {
+	if state.TunnelID != "" {
+		s.tunnelID = state.TunnelID
+	}
+	if state.PublicURL != "" {
+		s.publicURL = state.PublicURL
+	}
 }
 
 // PublicURL returns the public URL
@@ -2164,8 +2685,8 @@ func buildNewConnMessage(connID, remoteAddr string) []byte {
 	return buf
 }
 
-// buildCloseConnMessage builds close connection message
-func buildCloseConnMessage(connID string) []byte {
+// BuildCloseConnMessage builds close connection message
+func BuildCloseConnMessage(connID string) []byte {
 	connIDBytes := []byte(connID)
 
 	buf := make([]byte, 1+len(connIDBytes))
@@ -2179,13 +2700,14 @@ func buildCloseConnMessage(connID string) []byte {
 // Legacy Compatibility (for existing code)
 // ============================================
 
-// DefaultConfig returns default QUIC configuration
+// DefaultConfig returns default QUIC configuration with DATAGRAM support enabled
 func DefaultConfig() *quic.Config {
 	return &quic.Config{
 		MaxIncomingStreams:    10000,
 		MaxIncomingUniStreams: 1000,
 		KeepAlivePeriod:       30 * time.Second,
 		MaxIdleTimeout:        5 * time.Minute,
+		EnableDatagrams:       true,
 	}
 }
 
