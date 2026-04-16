@@ -522,25 +522,33 @@ tlsConfig := &tls.Config{
 
 // 创建 QUIC 多路复用服务器
 server := quic.NewMuxServer(quic.MuxServerConfig{
-    ListenAddr:     ":443",
-    TLSConfig:      tlsConfig,
-    AuthToken:      "secret",
-    PortRangeStart: 10000,
-    PortRangeEnd:   20000,
+    ListenAddr:       ":443",
+    TLSConfig:        tlsConfig,
+    AuthToken:        "secret",
+    PortRangeStart:   10000,
+    PortRangeEnd:     20000,
+    MaxTunnels:       10000,
+    MaxConnsPerTunnel: 1000,
 })
 server.Start(context.Background())
 
 // 创建 QUIC 多路复用客户端
 client := quic.NewMuxClient(quic.MuxClientConfig{
-    ServerAddr: "tunnel.example.com:443",
-    TLSConfig:  tlsConfig,
-    LocalAddr:  "localhost:8080",
-    AuthToken:  "secret",
+    ServerAddr:        "tunnel.example.com:443",
+    TLSConfig:         tlsConfig,
+    Protocol:          quic.ProtocolTCP,
+    LocalAddr:         "localhost:8080",
+    AuthToken:         "secret",
+    ReconnectInterval: 5 * time.Second,
 })
 client.Start(context.Background())
 ```
 
 > **性能优势**: 纯 QUIC 实现使用原生多路复用，封包效率比 HTTP/3 提升 3-10 倍，延迟降低约 50%。
+>
+> **高可用集成**:
+> - 服务端集成熔断器（防止级联故障）和连接限制器（防止资源耗尽）
+> - 客户端集成重试机制（指数退避重连）和背压控制（防止内存溢出）
 
 ### 集成服务器 (server)
 
