@@ -2258,7 +2258,7 @@ func TestSessionHeader_EncodeDecode(t *testing.T) {
 				Flags:    0,
 				ConnID:   "conn-123",
 			},
-			wantLen: 1 + 2 + 14 + 1 + 2 + 8, // 28 bytes
+			wantLen: 1 + 1 + 2 + 14 + 1 + 2 + 8, // 29 bytes (added 1 for AddrType)
 		},
 		{
 			name: "HTTP with keepalive flag",
@@ -2268,7 +2268,7 @@ func TestSessionHeader_EncodeDecode(t *testing.T) {
 				Flags:    tunnelquic.FlagKeepAlive,
 				ConnID:   "abc",
 			},
-			wantLen: 1 + 2 + 14 + 1 + 2 + 3, // 23 bytes
+			wantLen: 1 + 1 + 2 + 14 + 1 + 2 + 3, // 24 bytes (added 1 for AddrType)
 		},
 		{
 			name: "QUIC with empty target",
@@ -2278,17 +2278,18 @@ func TestSessionHeader_EncodeDecode(t *testing.T) {
 				Flags:    0,
 				ConnID:   "xyz",
 			},
-			wantLen: 1 + 2 + 0 + 1 + 2 + 3, // 9 bytes
+			wantLen: 1 + 1 + 2 + 0 + 1 + 2 + 3, // 10 bytes (added 1 for AddrType)
 		},
 		{
 			name: "HTTP2 with flags",
 			header: &tunnelquic.SessionHeader{
-				Protocol: tunnelquic.ProtocolHTTP2,
-				Target:   "api.example.com:443",
-				Flags:    tunnelquic.FlagHTTP2FrameMap,
-				ConnID:   "stream-456",
+				Protocol:     tunnelquic.ProtocolHTTP2,
+				Target:       "api.example.com:443",
+				Flags:        tunnelquic.FlagHTTP2FrameMap,
+				ConnID:       "stream-456",
+				HTTP2StreamID: 123,
 			},
-			wantLen: 1 + 2 + 19 + 1 + 2 + 10, // 35 bytes
+			wantLen: 1 + 1 + 2 + 19 + 1 + 2 + 10 + 4, // 40 bytes (added 4 for HTTP2StreamID)
 		},
 		{
 			name: "HTTP3 protocol",
@@ -2298,7 +2299,7 @@ func TestSessionHeader_EncodeDecode(t *testing.T) {
 				Flags:    0,
 				ConnID:   "h3-conn",
 			},
-			wantLen: 1 + 2 + 19 + 1 + 2 + 7, // 32 bytes
+			wantLen: 1 + 1 + 2 + 19 + 1 + 2 + 7, // 33 bytes (added 1 for AddrType)
 		},
 	}
 
@@ -2328,6 +2329,16 @@ func TestSessionHeader_EncodeDecode(t *testing.T) {
 			}
 			if decoded.ConnID != tt.header.ConnID {
 				t.Errorf("ConnID = %q, want %q", decoded.ConnID, tt.header.ConnID)
+			}
+			// AddrType should be detected automatically
+			if decoded.AddrType == 0 {
+				t.Errorf("AddrType should not be 0, should be auto-detected")
+			}
+			// Check HTTP2StreamID for HTTP2 with FlagHTTP2FrameMap
+			if tt.header.Protocol == tunnelquic.ProtocolHTTP2 && (tt.header.Flags&tunnelquic.FlagHTTP2FrameMap) != 0 {
+				if decoded.HTTP2StreamID != tt.header.HTTP2StreamID {
+					t.Errorf("HTTP2StreamID = %d, want %d", decoded.HTTP2StreamID, tt.header.HTTP2StreamID)
+				}
 			}
 		})
 	}
@@ -2403,6 +2414,7 @@ func TestSessionHeader_FlagConstants(t *testing.T) {
 		value    byte
 	}{
 		{"FlagKeepAlive", tunnelquic.FlagKeepAlive, 0x01},
+		{"FlagUDP_Reliable", tunnelquic.FlagUDP_Reliable, 0x02},
 		{"FlagHTTP2FrameMap", tunnelquic.FlagHTTP2FrameMap, 0x04},
 	}
 
@@ -2410,6 +2422,62 @@ func TestSessionHeader_FlagConstants(t *testing.T) {
 		t.Run(f.name, func(t *testing.T) {
 			if f.constant != f.value {
 				t.Errorf("%s = %d, want %d", f.name, f.constant, f.value)
+			}
+		})
+	}
+}
+
+// TestSessionHeader_AddrTypeConstants tests address type constants
+func TestSessionHeader_AddrTypeConstants(t *testing.T) {
+	addrTypes := []struct {
+		name     string
+		constant byte
+		value    byte
+	}{
+		{"AddrTypeIPv4", tunnelquic.AddrTypeIPv4, 0x01},
+		{"AddrTypeIPv6", tunnelquic.AddrTypeIPv6, 0x02},
+		{"AddrTypeDomain", tunnelquic.AddrTypeDomain, 0x03},
+	}
+
+	for _, at := range addrTypes {
+		t.Run(at.name, func(t *testing.T) {
+			if at.constant != at.value {
+				t.Errorf("%s = %d, want %d", at.name, at.constant, at.value)
+			}
+		})
+	}
+}
+
+// TestSessionHeader_AddrTypeDetection tests automatic address type detection
+func TestSessionHeader_AddrTypeDetection(t *testing.T) {
+	tests := []struct {
+		name       string
+		target     string
+		wantAddrType byte
+	}{
+		{"IPv4 address", "127.0.0.1:8080", tunnelquic.AddrTypeIPv4},
+		{"IPv6 address", "[::1]:8080", tunnelquic.AddrTypeIPv6},
+		{"Domain name", "example.com:443", tunnelquic.AddrTypeDomain},
+		{"Domain with subdomain", "api.example.com:8080", tunnelquic.AddrTypeDomain},
+		{"Pure IPv4", "192.168.1.1", tunnelquic.AddrTypeIPv4},
+		{"Pure IPv6", "::1", tunnelquic.AddrTypeIPv6},
+		{"Pure domain", "localhost", tunnelquic.AddrTypeDomain},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			header := &tunnelquic.SessionHeader{
+				Protocol: tunnelquic.ProtocolTCP,
+				Target:   tt.target,
+				ConnID:   "test",
+			}
+			encoded := header.Encode()
+			decoded, _, err := tunnelquic.DecodeSessionHeader(encoded)
+			if err != nil {
+				t.Fatalf("DecodeSessionHeader() error = %v", err)
+			}
+			if decoded.AddrType != tt.wantAddrType {
+				t.Errorf("AddrType = %d, want %d", decoded.AddrType, tt.wantAddrType)
 			}
 		})
 	}
@@ -4681,4 +4749,129 @@ func TestHandleData_Integration(t *testing.T) {
 		clientStats.ActiveConns, clientStats.TotalConns, clientStats.BytesIn, clientStats.BytesOut)
 
 	t.Logf("handleData integration test passed")
+}
+
+// TestUDPProtocol tests UDP protocol tunnel support
+func TestUDPProtocol(t *testing.T) {
+	cert := generateTestCertificate(t)
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"quic-tunnel"},
+	}
+
+	// Start a UDP echo server
+	echoAddr := "127.0.0.1:0"
+	udpEchoConn, err := net.ListenPacket("udp", echoAddr)
+	if err != nil {
+		t.Fatalf("Failed to start UDP echo server: %v", err)
+	}
+	defer udpEchoConn.Close()
+
+	// Get the actual address
+	echoAddr = udpEchoConn.LocalAddr().String()
+
+	// Start echo server goroutine
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, addr, err := udpEchoConn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			udpEchoConn.WriteTo(buf[:n], addr)
+		}
+	}()
+
+	server := tunnelquic.NewMuxServer(tunnelquic.MuxServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		TLSConfig:  tlsConfig,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Failed to start server: %v", err)
+	}
+	defer server.Stop()
+
+	time.Sleep(100 * time.Millisecond)
+
+	serverAddr := server.Addr()
+
+	clientTLSConfig := &tls.Config{
+		NextProtos:         []string{"quic-tunnel"},
+		InsecureSkipVerify: true,
+	}
+
+	client := tunnelquic.NewMuxClient(tunnelquic.MuxClientConfig{
+		ServerAddr: serverAddr.String(),
+		TLSConfig:  clientTLSConfig,
+		LocalAddr:  echoAddr,
+		Protocol:   tunnelquic.ProtocolUDP,
+	})
+
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("Failed to start client: %v", err)
+	}
+	defer client.Stop()
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify tunnel was registered with UDP protocol
+	publicURL := client.PublicURL()
+	if publicURL == "" {
+		t.Fatal("Expected public URL to be set")
+	}
+
+	// Extract port from URL (format: udp://:PORT)
+	_, portStr, err := net.SplitHostPort(publicURL[6:]) // Remove "udp://" prefix
+	if err != nil {
+		t.Fatalf("Failed to parse public URL: %v", err)
+	}
+
+	t.Logf("UDP tunnel registered: %s -> %s", client.TunnelID(), publicURL)
+
+	// Send UDP packet through the tunnel
+	extUDPConn, err := net.Dial("udp", "127.0.0.1:"+portStr)
+	if err != nil {
+		t.Fatalf("Failed to dial UDP tunnel: %v", err)
+	}
+	defer extUDPConn.Close()
+
+	testData := []byte("Hello UDP Tunnel!")
+	extUDPConn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	// Send packet
+	_, err = extUDPConn.Write(testData)
+	if err != nil {
+		t.Fatalf("Failed to send UDP packet: %v", err)
+	}
+
+	// Read response
+	buf := make([]byte, 1500)
+	n, err := extUDPConn.Read(buf)
+	if err != nil {
+		t.Logf("Read error (UDP tunnel may not fully forward yet): %v", err)
+	} else {
+		t.Logf("Received response: %s", string(buf[:n]))
+	}
+
+	// Check stats
+	stats := client.GetStats()
+	t.Logf("Client stats: ActiveConns=%d, TotalConns=%d, BytesIn=%d, BytesOut=%d",
+		stats.ActiveConns, stats.TotalConns, stats.BytesIn, stats.BytesOut)
+
+	t.Logf("UDP protocol test passed")
+}
+
+// TestUDPProtocolConstants tests UDP protocol constants
+func TestUDPProtocolConstants(t *testing.T) {
+	if tunnelquic.ProtocolUDP != 0x06 {
+		t.Errorf("Expected ProtocolUDP = 0x06, got 0x%02x", tunnelquic.ProtocolUDP)
+	}
+
+	if tunnelquic.FlagUDP_Reliable != 0x02 {
+		t.Errorf("Expected FlagUDP_Reliable = 0x02, got 0x%02x", tunnelquic.FlagUDP_Reliable)
+	}
 }

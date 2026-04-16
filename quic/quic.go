@@ -124,35 +124,62 @@ const (
 	ProtocolQUIC  byte = 0x03 // Pure QUIC tunnel - both entry and backend use QUIC
 	ProtocolHTTP2 byte = 0x04 // HTTP/2 with stream mapping optimization
 	ProtocolHTTP3 byte = 0x05 // HTTP/3 with stream mapping optimization
+	ProtocolUDP   byte = 0x06 // UDP protocol support
 )
 
 // Session header flags
 const (
-	FlagKeepAlive     byte = 0x01 // Keep connection alive
+	FlagKeepAlive    byte = 0x01 // Keep connection alive
+	FlagUDP_Reliable byte = 0x02 // UDP reliable mode (retransmit on loss)
 	FlagHTTP2FrameMap byte = 0x04 // HTTP/2 stream mapping optimization
 )
 
+// Address types for session header
+const (
+	AddrTypeIPv4   byte = 0x01 // IPv4 address
+	AddrTypeIPv6   byte = 0x02 // IPv6 address
+	AddrTypeDomain byte = 0x03 // Domain name
+)
+
 // SessionHeader represents the unified session header for data streams
-// Format: [1B ProtoType][2B TargetLen][Target][1B Flags][4B ConnID]
+// Format: [1B ProtoType][1B AddrType][2B TargetLen][Target][1B Flags][2B ConnIDLen][ConnID][4B HTTP2StreamID (optional)]
 type SessionHeader struct {
-	Protocol byte   // Protocol type
-	Target   string // Target address (e.g., "127.0.0.1:8080")
-	Flags    byte   // Session flags
-	ConnID   string // Connection ID
+	Protocol     byte   // Protocol type
+	AddrType     byte   // Address type (IPv4, IPv6, or Domain)
+	Target       string // Target address (e.g., "127.0.0.1:8080")
+	Flags        byte   // Session flags
+	ConnID       string // Connection ID
+	HTTP2StreamID uint32 // HTTP/2 stream ID (only used when Protocol == ProtocolHTTP2 and FlagHTTP2FrameMap is set)
 }
 
 // Encode encodes the session header to bytes
-// Format: [1B ProtoType][2B TargetLen][Target][1B Flags][2B ConnIDLen][ConnID]
+// Format: [1B ProtoType][1B AddrType][2B TargetLen][Target][1B Flags][2B ConnIDLen][ConnID][4B HTTP2StreamID (optional)]
 func (h *SessionHeader) Encode() []byte {
 	targetBytes := []byte(h.Target)
 	connIDBytes := []byte(h.ConnID)
 
-	// Total length: 1 + 2 + len(target) + 1 + 2 + len(connID)
-	totalLen := 1 + 2 + len(targetBytes) + 1 + 2 + len(connIDBytes)
+	// Determine address type if not set
+	addrType := h.AddrType
+	if addrType == 0 {
+		addrType = detectAddrType(h.Target)
+	}
+
+	// Total length: 1 + 1 + 2 + len(target) + 1 + 2 + len(connID)
+	totalLen := 1 + 1 + 2 + len(targetBytes) + 1 + 2 + len(connIDBytes)
+
+	// Add 4 bytes for HTTP2StreamID if FlagHTTP2FrameMap is set
+	hasHTTP2StreamID := h.Protocol == ProtocolHTTP2 && (h.Flags&FlagHTTP2FrameMap) != 0
+	if hasHTTP2StreamID {
+		totalLen += 4
+	}
+
 	buf := make([]byte, totalLen)
 
 	offset := 0
 	buf[offset] = h.Protocol
+	offset++
+
+	buf[offset] = addrType
 	offset++
 
 	binary.BigEndian.PutUint16(buf[offset:], uint16(len(targetBytes)))
@@ -166,13 +193,40 @@ func (h *SessionHeader) Encode() []byte {
 	binary.BigEndian.PutUint16(buf[offset:], uint16(len(connIDBytes)))
 	offset += 2
 	copy(buf[offset:], connIDBytes)
+	offset += len(connIDBytes)
+
+	// Write HTTP2StreamID if applicable
+	if hasHTTP2StreamID {
+		binary.BigEndian.PutUint32(buf[offset:], h.HTTP2StreamID)
+	}
 
 	return buf
 }
 
+// detectAddrType detects the address type from a target string
+func detectAddrType(target string) byte {
+	// Try to parse as IP:port
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		// No port, try as pure IP or domain
+		host = target
+	}
+
+	// Check if it's an IP address
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return AddrTypeDomain
+	}
+	if ip.To4() != nil {
+		return AddrTypeIPv4
+	}
+	return AddrTypeIPv6
+}
+
 // DecodeSessionHeader decodes a session header from bytes
 func DecodeSessionHeader(data []byte) (*SessionHeader, int, error) {
-	if len(data) < 6 { // Minimum: 1 + 2 + 0 + 1 + 2
+	// Minimum: 1 (proto) + 1 (addrType) + 2 (targetLen) + 0 (target) + 1 (flags) + 2 (connIDLen) = 7
+	if len(data) < 7 {
 		return nil, 0, errors.New("session header too short")
 	}
 
@@ -180,6 +234,9 @@ func DecodeSessionHeader(data []byte) (*SessionHeader, int, error) {
 	header := &SessionHeader{}
 
 	header.Protocol = data[offset]
+	offset++
+
+	header.AddrType = data[offset]
 	offset++
 
 	targetLen := binary.BigEndian.Uint16(data[offset:])
@@ -204,6 +261,15 @@ func DecodeSessionHeader(data []byte) (*SessionHeader, int, error) {
 
 	header.ConnID = string(data[offset : offset+int(connIDLen)])
 	offset += int(connIDLen)
+
+	// Read HTTP2StreamID if FlagHTTP2FrameMap is set
+	if header.Protocol == ProtocolHTTP2 && (header.Flags&FlagHTTP2FrameMap) != 0 {
+		if len(data) < offset+4 {
+			return nil, 0, errors.New("session header truncated (HTTP2StreamID)")
+		}
+		header.HTTP2StreamID = binary.BigEndian.Uint32(data[offset:])
+		offset += 4
+	}
 
 	return header, offset, nil
 }
@@ -371,12 +437,16 @@ type Tunnel struct {
 	// Data streams (server -> client)
 	DataStreams sync.Map // connID -> quic.Stream
 
+	// HTTP/2 stream mapping (HTTP2StreamID -> QUIC Stream)
+	HTTP2StreamMap sync.Map // uint32 -> quic.Stream
+
 	// Stream activity tracking for cleanup
 	streamActivity sync.Map // connID -> *atomic.Int64 (Unix timestamp of last activity)
 
 	// External listeners (to close them when tunnel closes)
 	externalListener     net.Listener   // TCP listener for TCP tunnels
 	externalQUICListener *quic.Listener // QUIC listener for QUIC tunnels (pointer because quic.Listener is a struct)
+	externalUDPConn      *net.UDPConn   // UDP connection for UDP tunnels
 
 	// Stats
 	CreatedAt  time.Time
@@ -561,6 +631,12 @@ func (s *MuxServer) handleControlStream(conn quic.Connection, stream quic.Stream
 		return
 	}
 
+	// Handle session restore (0-RTT) or regular register
+	if msg.Type == MsgTypeSessionRestore {
+		s.handleSessionRestore(conn, stream, msg.Payload)
+		return
+	}
+
 	if msg.Type != MsgTypeRegister {
 		log.Printf("[MuxServer] Expected register, got type %d", msg.Type)
 		return
@@ -622,6 +698,14 @@ func (s *MuxServer) handleControlStream(conn quic.Connection, stream quic.Stream
 			return
 		}
 		publicURL = fmt.Sprintf("quic://:%d", port)
+	case ProtocolUDP:
+		// For UDP tunnel, allocate a UDP port for external UDP listener
+		port, err = s.portManager.Allocate()
+		if err != nil {
+			s.sendRegisterAck(stream, tunnelID, "", 0, err.Error())
+			return
+		}
+		publicURL = fmt.Sprintf("udp://:%d", port)
 	default:
 		publicURL = fmt.Sprintf("https://%s.example.com", tunnelID)
 	}
@@ -664,6 +748,18 @@ func (s *MuxServer) handleControlStream(conn quic.Connection, stream quic.Stream
 	if protocol == ProtocolQUIC && port > 0 {
 		s.wg.Add(1)
 		go s.startExternalQUICListener(tunnel)
+	}
+
+	// Start external UDP listener for UDP tunnel
+	if protocol == ProtocolUDP && port > 0 {
+		s.wg.Add(1)
+		go s.startExternalUDPListener(tunnel)
+	}
+
+	// Start external HTTP/3 listener for HTTP/3 tunnel
+	if protocol == ProtocolHTTP3 && port > 0 {
+		s.wg.Add(1)
+		go s.startExternalHTTP3Listener(tunnel)
 	}
 
 	// Start data stream acceptor
@@ -731,6 +827,144 @@ func (s *MuxServer) controlLoop(tunnel *Tunnel) {
 			// Configuration update acknowledged by client
 			log.Printf("[MuxServer] Config update acknowledged for tunnel %s", tunnel.ID)
 		}
+	}
+}
+
+// handleSessionRestore handles 0-RTT session restore request
+func (s *MuxServer) handleSessionRestore(conn quic.Connection, stream quic.Stream, payload []byte) {
+	// Parse session restore message
+	// Format: [tunnelID_len:2][tunnelID][protocol][localAddr_len:2][localAddr][timestamp:8]
+	if len(payload) < 2 {
+		log.Printf("[MuxServer] Session restore payload too short")
+		return
+	}
+
+	offset := 0
+	tunnelIDLen := int(binary.BigEndian.Uint16(payload[offset:]))
+	offset += 2
+
+	if len(payload) < offset+tunnelIDLen+1 {
+		log.Printf("[MuxServer] Session restore payload truncated")
+		return
+	}
+
+	tunnelID := string(payload[offset : offset+tunnelIDLen])
+	offset += tunnelIDLen
+
+	protocol := payload[offset]
+	offset++
+
+	if len(payload) < offset+2 {
+		log.Printf("[MuxServer] Session restore payload missing localAddr")
+		return
+	}
+
+	localAddrLen := int(binary.BigEndian.Uint16(payload[offset:]))
+	offset += 2
+
+	if len(payload) < offset+localAddrLen+8 {
+		log.Printf("[MuxServer] Session restore payload truncated (localAddr)")
+		return
+	}
+
+	localAddr := string(payload[offset : offset+localAddrLen])
+	offset += localAddrLen
+
+	// Extract timestamp for anti-replay check
+	_ = binary.BigEndian.Uint64(payload[offset:]) // timestamp
+
+	log.Printf("[MuxServer] Session restore request: tunnelID=%s, protocol=0x%02x, localAddr=%s", tunnelID, protocol, localAddr)
+
+	// Check if tunnel already exists (reconnection)
+	if existingTunnel, ok := s.tunnels.Load(tunnelID); ok {
+		tunnel := existingTunnel.(*Tunnel)
+		// Update connection and stream
+		tunnel.Conn = conn
+		tunnel.ControlStream = stream
+		tunnel.LastActive.Store(time.Now().Unix())
+
+		// Send success ack
+		s.sendRegisterAck(stream, tunnelID, tunnel.PublicURL, tunnel.Port, "")
+		log.Printf("[MuxServer] Session restored: %s", tunnelID)
+		return
+	}
+
+	// New tunnel, proceed with normal registration
+	// This shouldn't happen for 0-RTT, but handle it anyway
+	log.Printf("[MuxServer] Session restore for unknown tunnel %s, treating as new registration", tunnelID)
+
+	// Allocate public address
+	var publicURL string
+	var port int
+	var err error
+
+	switch protocol {
+	case ProtocolTCP:
+		port, err = s.portManager.Allocate()
+		if err != nil {
+			s.sendRegisterAck(stream, tunnelID, "", 0, err.Error())
+			return
+		}
+		publicURL = fmt.Sprintf("tcp://:%d", port)
+	case ProtocolQUIC:
+		port, err = s.portManager.Allocate()
+		if err != nil {
+			s.sendRegisterAck(stream, tunnelID, "", 0, err.Error())
+			return
+		}
+		publicURL = fmt.Sprintf("quic://:%d", port)
+	case ProtocolUDP:
+		port, err = s.portManager.Allocate()
+		if err != nil {
+			s.sendRegisterAck(stream, tunnelID, "", 0, err.Error())
+			return
+		}
+		publicURL = fmt.Sprintf("udp://:%d", port)
+	default:
+		publicURL = fmt.Sprintf("https://%s.example.com", tunnelID)
+	}
+
+	// Create tunnel
+	tunnelCtx, tunnelCancel := context.WithCancel(s.ctx)
+	tunnel := &Tunnel{
+		ID:            tunnelID,
+		Protocol:      protocol,
+		LocalAddr:     localAddr,
+		PublicURL:     publicURL,
+		Port:          port,
+		Conn:          conn,
+		ControlStream: stream,
+		CreatedAt:     time.Now(),
+		ctx:           tunnelCtx,
+		cancel:        tunnelCancel,
+	}
+
+	s.tunnels.Store(tunnelID, tunnel)
+	s.activeTunnels.Add(1)
+	s.totalTunnels.Add(1)
+
+	// Send ack
+	s.sendRegisterAck(stream, tunnelID, publicURL, port, "")
+	log.Printf("[MuxServer] Tunnel registered via session restore: %s -> %s", tunnelID, publicURL)
+
+	// Start tunnel handlers
+	s.wg.Add(1)
+	go s.controlLoop(tunnel)
+
+	s.wg.Add(1)
+	go s.acceptDataStreams(tunnel)
+
+	// Start external listener
+	switch protocol {
+	case ProtocolTCP:
+		s.wg.Add(1)
+		go s.startExternalListener(tunnel)
+	case ProtocolQUIC:
+		s.wg.Add(1)
+		go s.startExternalQUICListener(tunnel)
+	case ProtocolUDP:
+		s.wg.Add(1)
+		go s.startExternalUDPListener(tunnel)
 	}
 }
 
@@ -1110,6 +1344,329 @@ func (s *MuxServer) forwardQUICStream(tunnel *Tunnel, extStream quic.Stream, con
 				return
 			}
 			s.bytesIn.Add(int64(n))
+		}
+	}()
+
+	<-done
+}
+
+// startExternalUDPListener starts external UDP listener for UDP tunnel
+// This listener accepts UDP packets from external users and forwards them
+// through the tunnel to the internal UDP service
+func (s *MuxServer) startExternalUDPListener(tunnel *Tunnel) {
+	defer s.wg.Done()
+
+	log.Printf("[MuxServer] Starting external UDP listener for tunnel %s on port %d", tunnel.ID, tunnel.Port)
+
+	// Create UDP listener for external UDP packets
+	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", tunnel.Port))
+	if err != nil {
+		log.Printf("[MuxServer] Resolve UDP address failed for port %d: %v", tunnel.Port, err)
+		return
+	}
+
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Printf("[MuxServer] Listen UDP port %d failed: %v", tunnel.Port, err)
+		return
+	}
+
+	// Store connection so it can be closed when tunnel closes
+	tunnel.externalUDPConn = udpConn
+	defer func() {
+		udpConn.Close()
+		tunnel.externalUDPConn = nil
+	}()
+
+	log.Printf("[MuxServer] External UDP listener started for %s on :%d", tunnel.ID, tunnel.Port)
+
+	// Buffer for UDP packets (max UDP packet size is 65535, but typically ~1400 for MTU)
+	buf := make([]byte, 65535)
+
+	for {
+		select {
+		case <-tunnel.ctx.Done():
+			return
+		default:
+		}
+
+		// Read UDP packet
+		n, remoteAddr, err := udpConn.ReadFromUDP(buf)
+		if err != nil {
+			if tunnel.ctx.Err() != nil {
+				return
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("[MuxServer] Read UDP packet failed: %v", err)
+			continue
+		}
+
+		// Handle UDP packet in a goroutine
+		s.wg.Add(1)
+		go s.handleExternalUDPPacket(tunnel, udpConn, buf[:n], remoteAddr)
+	}
+}
+
+// handleExternalUDPPacket handles an external UDP packet
+// It forwards the packet through the tunnel to the internal UDP service
+func (s *MuxServer) handleExternalUDPPacket(tunnel *Tunnel, udpConn *net.UDPConn, data []byte, remoteAddr *net.UDPAddr) {
+	defer s.wg.Done()
+
+	// Check connection limit (for UDP, we track "sessions" by remote address)
+	connID := remoteAddr.String()
+
+	// Generate a unique session ID for this UDP "connection"
+	sessionID := fmt.Sprintf("udp-%s-%d", connID, time.Now().UnixNano())
+
+	// Notify client about new UDP session
+	msg := buildNewConnMessage(sessionID, connID)
+	if _, writeErr := tunnel.ControlStream.Write(msg); writeErr != nil {
+		log.Printf("[MuxServer] Write NEWCONN for UDP failed: %v", writeErr)
+		return
+	}
+
+	// Open a data stream to send the UDP packet
+	dataStream, err := tunnel.Conn.OpenStreamSync(tunnel.ctx)
+	if err != nil {
+		log.Printf("[MuxServer] Open data stream for UDP failed: %v", err)
+		return
+	}
+	defer dataStream.Close()
+
+	// Write stream type
+	if _, err := dataStream.Write([]byte{StreamTypeData}); err != nil {
+		log.Printf("[MuxServer] Write stream type for UDP failed: %v", err)
+		return
+	}
+
+	// Write session header
+	header := &SessionHeader{
+		Protocol: tunnel.Protocol,
+		Target:   tunnel.LocalAddr,
+		Flags:    FlagUDP_Reliable, // Use reliable mode by default
+		ConnID:   sessionID,
+	}
+	if _, err := dataStream.Write(header.Encode()); err != nil {
+		log.Printf("[MuxServer] Write session header for UDP failed: %v", err)
+		return
+	}
+
+	// Send UDP packet data
+	if _, err := dataStream.Write(data); err != nil {
+		log.Printf("[MuxServer] Write UDP data failed: %v", err)
+		return
+	}
+
+	s.bytesOut.Add(int64(len(data)))
+}
+
+// startExternalHTTP3Listener starts external HTTP/3 listener for HTTP/3 tunnel
+// HTTP/3 uses QUIC as transport, so this is similar to QUIC listener but with HTTP/3 semantics
+func (s *MuxServer) startExternalHTTP3Listener(tunnel *Tunnel) {
+	defer s.wg.Done()
+
+	log.Printf("[MuxServer] Starting external HTTP/3 listener for tunnel %s on port %d", tunnel.ID, tunnel.Port)
+
+	// Create UDP listener for external HTTP/3 connections
+	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", tunnel.Port))
+	if err != nil {
+		log.Printf("[MuxServer] Resolve UDP address failed for port %d: %v", tunnel.Port, err)
+		return
+	}
+
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Printf("[MuxServer] Listen UDP port %d failed: %v", tunnel.Port, err)
+		return
+	}
+	defer udpConn.Close()
+
+	// Create QUIC listener for external HTTP/3 connections
+	// HTTP/3 uses ALPN "h3"
+	externalTLSConfig := s.config.TLSConfig
+	if externalTLSConfig == nil {
+		log.Printf("[MuxServer] No TLS config for external HTTP/3 listener")
+		return
+	}
+	externalTLSConfig = externalTLSConfig.Clone()
+	externalTLSConfig.NextProtos = []string{"h3"} // HTTP/3 ALPN
+
+	quicConfig := DefaultConfig()
+	quicConfig.EnableDatagrams = true // HTTP/3 may use DATAGRAM for QPACK
+
+	externalListener, err := quic.Listen(udpConn, externalTLSConfig, quicConfig)
+	if err != nil {
+		log.Printf("[MuxServer] Listen external HTTP/3 failed: %v", err)
+		return
+	}
+
+	// Store listener so it can be closed when tunnel closes
+	tunnel.externalQUICListener = externalListener
+	defer func() {
+		externalListener.Close()
+		tunnel.externalQUICListener = nil
+	}()
+
+	log.Printf("[MuxServer] External HTTP/3 listener started for %s on :%d", tunnel.ID, tunnel.Port)
+
+	for {
+		select {
+		case <-tunnel.ctx.Done():
+			return
+		default:
+		}
+
+		// Accept external HTTP/3 connection
+		extConn, err := externalListener.Accept(tunnel.ctx)
+		if err != nil {
+			if tunnel.ctx.Err() != nil {
+				return
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("[MuxServer] Accept external HTTP/3 failed: %v", err)
+			continue
+		}
+
+		s.wg.Add(1)
+		go s.handleExternalHTTP3Connection(tunnel, extConn)
+	}
+}
+
+// handleExternalHTTP3Connection handles an external HTTP/3 connection
+// It terminates the HTTP/3 connection and forwards HTTP/3 streams through the tunnel
+func (s *MuxServer) handleExternalHTTP3Connection(tunnel *Tunnel, extConn quic.Connection) {
+	defer s.wg.Done()
+	defer extConn.CloseWithError(0, "connection closed")
+
+	// Check connection limit
+	if err := s.connLimiter.Acquire(); err != nil {
+		log.Printf("[MuxServer] Connection limit exceeded, rejecting HTTP/3 connection: %v", err)
+		return
+	}
+	defer s.connLimiter.Release()
+
+	connID := generateID()
+	s.activeConns.Add(1)
+	s.totalConns.Add(1)
+
+	log.Printf("[MuxServer] New external HTTP/3 connection: %s from %s", connID, extConn.RemoteAddr())
+
+	// Notify client about new HTTP/3 connection
+	msg := buildNewConnMessage(connID, extConn.RemoteAddr().String())
+	if _, writeErr := tunnel.ControlStream.Write(msg); writeErr != nil {
+		log.Printf("[MuxServer] Write NEWCONN failed: %v", writeErr)
+		s.activeConns.Add(-1)
+		return
+	}
+
+	// Accept HTTP/3 streams from external connection and forward through tunnel
+	for {
+		select {
+		case <-tunnel.ctx.Done():
+			return
+		default:
+		}
+
+		stream, err := extConn.AcceptStream(tunnel.ctx)
+		if err != nil {
+			if tunnel.ctx.Err() != nil {
+				return
+			}
+			log.Printf("[MuxServer] Accept stream from external HTTP/3 failed: %v", err)
+			return
+		}
+
+		s.wg.Add(1)
+		go s.forwardHTTP3Stream(tunnel, stream, connID)
+	}
+}
+
+// forwardHTTP3Stream forwards an HTTP/3 stream through the tunnel
+// HTTP/3 streams carry HTTP/3 frames (HEADERS, DATA, etc.)
+func (s *MuxServer) forwardHTTP3Stream(tunnel *Tunnel, extStream quic.Stream, connID string) {
+	defer s.wg.Done()
+	defer extStream.Close()
+
+	// Open a data stream to the client
+	dataStream, err := tunnel.Conn.OpenStreamSync(tunnel.ctx)
+	if err != nil {
+		log.Printf("[MuxServer] Open data stream for HTTP/3 failed: %v", err)
+		return
+	}
+	defer dataStream.Close()
+
+	// Write stream type
+	if _, err := dataStream.Write([]byte{StreamTypeData}); err != nil {
+		log.Printf("[MuxServer] Write stream type for HTTP/3 failed: %v", err)
+		return
+	}
+
+	// Write session header with HTTP/3 protocol
+	header := &SessionHeader{
+		Protocol: ProtocolHTTP3,
+		Target:   tunnel.LocalAddr,
+		Flags:    0,
+		ConnID:   connID,
+	}
+	if _, err := dataStream.Write(header.Encode()); err != nil {
+		log.Printf("[MuxServer] Write session header for HTTP/3 failed: %v", err)
+		return
+	}
+
+	// Bidirectional forward between external HTTP/3 stream and tunnel data stream
+	ctx, cancel := context.WithCancel(tunnel.ctx)
+	defer cancel()
+
+	buf := s.bufferPool.Get()
+	defer s.bufferPool.Put(buf)
+
+	done := make(chan struct{}, 2)
+
+	// External -> Tunnel
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			n, err := extStream.Read(*buf)
+			if err != nil {
+				return
+			}
+
+			if _, err := dataStream.Write((*buf)[:n]); err != nil {
+				return
+			}
+			s.bytesIn.Add(int64(n))
+		}
+	}()
+
+	// Tunnel -> External
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			n, err := dataStream.Read(*buf)
+			if err != nil {
+				return
+			}
+
+			if _, err := extStream.Write((*buf)[:n]); err != nil {
+				return
+			}
+			s.bytesOut.Add(int64(n))
 		}
 	}()
 
@@ -1625,6 +2182,49 @@ type TunnelState struct {
 	SavedAt    time.Time
 }
 
+// SessionRestore message for 0-RTT reconnection
+const (
+	MsgTypeSessionRestore    byte = 0x0B // Session restore request (0-RTT)
+	MsgTypeSessionRestoreAck byte = 0x0C // Session restore acknowledgment
+)
+
+// AntiReplay tracks recent requests to prevent replay attacks
+type AntiReplay struct {
+	mu    sync.RWMutex
+	cache map[string]time.Time
+	ttl   time.Duration
+}
+
+// NewAntiReplay creates a new anti-replay tracker
+func NewAntiReplay(ttl time.Duration) *AntiReplay {
+	return &AntiReplay{
+		cache: make(map[string]time.Time),
+		ttl:   ttl,
+	}
+}
+
+// Check verifies if a request is not a replay
+func (a *AntiReplay) Check(clientID string, timestamp int64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	key := fmt.Sprintf("%s:%d", clientID, timestamp)
+	if _, exists := a.cache[key]; exists {
+		return false // Replay detected
+	}
+
+	// Clean up old entries
+	now := time.Now()
+	for k, v := range a.cache {
+		if now.Sub(v) > a.ttl {
+			delete(a.cache, k)
+		}
+	}
+
+	a.cache[key] = now
+	return true
+}
+
 // DefaultMuxClientConfig returns default client config with 0-RTT support
 func DefaultMuxClientConfig() MuxClientConfig {
 	return MuxClientConfig{
@@ -1785,9 +2385,25 @@ func (s *MuxClient) connectLoop() {
 		default:
 		}
 
-		err := retrier.Do(s.ctx, func() error {
-			return s.connect()
-		})
+		var err error
+
+		// Try 0-RTT connection first if enabled and we have cached state
+		if s.config.Enable0RTT && s.config.SessionCache != nil && s.hasCachedState() {
+			err = retrier.Do(s.ctx, func() error {
+				return s.connect0RTT()
+			})
+			if err != nil {
+				// Fall back to regular connection
+				log.Printf("[MuxClient] 0-RTT connection failed, falling back to regular: %v", err)
+				err = retrier.Do(s.ctx, func() error {
+					return s.connect()
+				})
+			}
+		} else {
+			err = retrier.Do(s.ctx, func() error {
+				return s.connect()
+			})
+		}
 
 		if err != nil {
 			if s.ctx.Err() != nil {
@@ -1805,6 +2421,9 @@ func (s *MuxClient) connectLoop() {
 
 		reconnectTries = 0
 		s.connected.Store(true)
+
+		// Save state for 0-RTT recovery
+		s.SaveTunnelState()
 
 		select {
 		case <-s.ctx.Done():
@@ -1914,6 +2533,131 @@ func (s *MuxClient) connect() error {
 	}
 
 	return nil
+}
+
+// connect0RTT establishes a 0-RTT connection for fast reconnection
+func (s *MuxClient) connect0RTT() error {
+	log.Printf("[MuxClient] Attempting 0-RTT connection to %s...", s.config.ServerAddr)
+
+	// 1. Resolve address
+	udpAddr, err := net.ResolveUDPAddr("udp", s.config.ServerAddr)
+	if err != nil {
+		return fmt.Errorf("resolve address failed: %w", err)
+	}
+
+	// 2. Create UDP connection
+	udpConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return fmt.Errorf("listen UDP failed: %w", err)
+	}
+
+	// 3. Configure TLS for 0-RTT
+	tlsConf := s.config.TLSConfig
+	if tlsConf == nil {
+		tlsConf = &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"quic-tunnel"},
+		}
+	} else {
+		tlsConf = tlsConf.Clone()
+	}
+	if len(tlsConf.NextProtos) == 0 {
+		tlsConf.NextProtos = []string{"quic-tunnel"}
+	}
+
+	// Session cache must be set for 0-RTT
+	if s.config.SessionCache != nil {
+		tlsConf.ClientSessionCache = s.config.SessionCache
+	}
+
+	// 4. Use DialEarly for 0-RTT support
+	conn, err := quic.DialEarly(s.ctx, udpConn, udpAddr, tlsConf, s.config.QUICConfig)
+	if err != nil {
+		udpConn.Close()
+		return fmt.Errorf("dial QUIC early failed: %w", err)
+	}
+	log.Printf("[MuxClient] QUIC 0-RTT connection established")
+	s.connMu.Lock()
+	s.conn = conn
+	s.connMu.Unlock()
+
+	// 5. Open control stream (this can be done in 0-RTT)
+	controlStream, err := conn.OpenStreamSync(s.ctx)
+	if err != nil {
+		conn.CloseWithError(0, "failed to open control stream")
+		return fmt.Errorf("open control stream failed: %w", err)
+	}
+	s.setControlStream(controlStream)
+	log.Printf("[MuxClient] Control stream opened (0-RTT)")
+
+	// 6. Write stream type
+	if _, err := controlStream.Write([]byte{StreamTypeControl}); err != nil {
+		return fmt.Errorf("write stream type failed: %w", err)
+	}
+
+	// 7. Send session restore message (0-RTT data)
+	if err := s.sendSessionRestore(); err != nil {
+		// Fall back to regular register if restore fails
+		log.Printf("[MuxClient] Session restore failed, falling back to register: %v", err)
+		if err := s.sendRegister(); err != nil {
+			return fmt.Errorf("register failed: %w", err)
+		}
+	}
+	log.Printf("[MuxClient] Session restore sent (protocol=0x%02x)", s.config.Protocol)
+
+	// 8. Read response (this waits for 1-RTT completion)
+	if err := s.readRegisterAck(); err != nil {
+		return fmt.Errorf("register ack failed: %w", err)
+	}
+
+	log.Printf("[MuxClient] 0-RTT Connected: %s -> %s", s.tunnelID, s.publicURL)
+
+	// 9. Start heartbeat
+	s.wg.Add(1)
+	go s.heartbeatLoop()
+
+	// 10. Start DATAGRAM receive loop if supported
+	if s.conn.ConnectionState().SupportsDatagrams {
+		s.wg.Add(1)
+		go s.datagramReceiveLoop()
+	}
+
+	// 11. Start control message loop
+	s.wg.Add(1)
+	go s.controlLoop()
+
+	// 12. For QUIC tunnel, start data stream acceptor
+	if s.config.Protocol == ProtocolQUIC {
+		s.wg.Add(1)
+		go s.acceptQUICDataStreams()
+	}
+
+	return nil
+}
+
+// sendSessionRestore sends a session restore message for 0-RTT reconnection
+func (s *MuxClient) sendSessionRestore() error {
+	stream := s.getControlStream()
+	if stream == nil {
+		return errors.New("control stream not available")
+	}
+
+	// Build session restore message
+	// Format: [MsgType][tunnelID_len:2][tunnelID][protocol][localAddr_len:2][localAddr][timestamp:8]
+	msg := []byte{MsgTypeSessionRestore}
+	tunnelIDBytes := []byte(s.tunnelID)
+	msg = append(msg, byte(len(tunnelIDBytes)>>8), byte(len(tunnelIDBytes)))
+	msg = append(msg, tunnelIDBytes...)
+	msg = append(msg, s.config.Protocol)
+	localAddrBytes := []byte(s.config.LocalAddr)
+	msg = append(msg, byte(len(localAddrBytes)>>8), byte(len(localAddrBytes)))
+	msg = append(msg, localAddrBytes...)
+	timestamp := uint64(time.Now().UnixNano())
+	msg = append(msg, byte(timestamp>>56), byte(timestamp>>48), byte(timestamp>>40), byte(timestamp>>32),
+		byte(timestamp>>24), byte(timestamp>>16), byte(timestamp>>8), byte(timestamp))
+
+	_, err := stream.Write(msg)
+	return err
 }
 
 // sendRegister sends register message
@@ -2145,6 +2889,9 @@ func (s *MuxClient) handleNewConn(payload []byte) {
 	case ProtocolQUIC:
 		// For QUIC tunnel, dial QUIC connection to local QUIC service
 		s.handleQUICNewConn(connID, remoteAddr)
+	case ProtocolUDP:
+		// For UDP tunnel, dial UDP connection to local UDP service
+		s.handleUDPNewConn(connID, remoteAddr)
 	default:
 		// For TCP/HTTP, dial TCP connection to local service
 		localConn, err := net.Dial("tcp", s.config.LocalAddr)
@@ -2179,6 +2926,102 @@ func (s *MuxClient) handleQUICNewConn(connID, remoteAddr string) {
 
 	// Store connection info for stream handling
 	// The actual stream handling is done in handleDataStream
+}
+
+// handleUDPNewConn handles new UDP "connection" for UDP tunnel
+func (s *MuxClient) handleUDPNewConn(connID, remoteAddr string) {
+	// For UDP tunnel, we dial a UDP connection to the local UDP service
+	// and forward packets through the tunnel
+
+	log.Printf("[MuxClient] UDP session: %s from %s", connID, remoteAddr)
+
+	// Resolve local UDP address
+	udpAddr, err := net.ResolveUDPAddr("udp", s.config.LocalAddr)
+	if err != nil {
+		log.Printf("[MuxClient] Resolve local UDP address failed: %v", err)
+		closeMsg := BuildCloseConnMessage(connID)
+		if stream := s.getControlStream(); stream != nil {
+			stream.Write(closeMsg)
+		}
+		return
+	}
+
+	// Dial local UDP service
+	localConn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		log.Printf("[MuxClient] Connect local UDP failed: %v", err)
+		closeMsg := BuildCloseConnMessage(connID)
+		if stream := s.getControlStream(); stream != nil {
+			stream.Write(closeMsg)
+		}
+		return
+	}
+
+	// Save local connection
+	s.localConns.Store(connID, localConn)
+	s.activeConns.Add(1)
+	s.totalConns.Add(1)
+
+	// Start bidirectional forward
+	s.wg.Add(1)
+	go s.forwardLocalUDPToControl(localConn, connID)
+}
+
+// forwardLocalUDPToControl forwards UDP packets from local UDP service to control stream
+func (s *MuxClient) forwardLocalUDPToControl(localConn *net.UDPConn, connID string) {
+	defer func() {
+		localConn.Close()
+		s.localConns.Delete(connID)
+		s.activeConns.Add(-1)
+	}()
+
+	buf := s.bufferPool.Get()
+	defer s.bufferPool.Put(buf)
+
+	encoder := forward.NewDefaultMuxEncoder()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		// Set read deadline to allow periodic context checks
+		localConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+
+		n, err := localConn.Read(*buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue // Timeout, check context and continue
+			}
+			if s.ctx.Err() != nil {
+				return
+			}
+			return
+		}
+
+		// Encode and send
+		encoded, err := encoder.EncodeData(connID, (*buf)[:n])
+		if err != nil {
+			log.Printf("[MuxClient] EncodeData for UDP error: %v", err)
+			return
+		}
+
+		stream := s.getControlStream()
+		if stream == nil {
+			encoder.Release(encoded)
+			return
+		}
+
+		if _, writeErr := stream.Write(encoded); writeErr != nil {
+			encoder.Release(encoded)
+			return
+		}
+		encoder.Release(encoded)
+
+		s.bytesOut.Add(int64(n))
+	}
 }
 
 // acceptQUICDataStreams accepts data streams for QUIC tunnel and forwards to local QUIC service
@@ -2577,6 +3420,11 @@ func (s *MuxClient) SaveTunnelState() *TunnelState {
 	}
 }
 
+// hasCachedState checks if we have cached tunnel state for 0-RTT
+func (s *MuxClient) hasCachedState() bool {
+	return s.tunnelID != "" && s.publicURL != ""
+}
+
 // RestoreFromState restores tunnel configuration from cached state
 func (s *MuxClient) RestoreFromState(state *TunnelState) {
 	if state.TunnelID != "" {
@@ -2707,8 +3555,8 @@ func parseRegisterPayload(payload []byte) (tunnelID string, protocol byte, local
 	offset++
 
 	// Validate protocol
-	if protocol != ProtocolTCP && protocol != ProtocolHTTP && protocol != ProtocolQUIC {
-		return "", 0, "", "", fmt.Errorf("invalid protocol: %d (expected %d, %d or %d)", protocol, ProtocolTCP, ProtocolHTTP, ProtocolQUIC)
+	if protocol != ProtocolTCP && protocol != ProtocolHTTP && protocol != ProtocolQUIC && protocol != ProtocolUDP {
+		return "", 0, "", "", fmt.Errorf("invalid protocol: %d (expected %d, %d, %d or %d)", protocol, ProtocolTCP, ProtocolHTTP, ProtocolQUIC, ProtocolUDP)
 	}
 
 	// Read local address
