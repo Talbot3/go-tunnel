@@ -92,6 +92,7 @@ const (
 const (
 	ProtocolTCP  byte = 0x01
 	ProtocolHTTP byte = 0x02
+	ProtocolQUIC byte = 0x03 // Pure QUIC tunnel - both entry and backend use QUIC
 )
 
 // Default intervals and sizes
@@ -235,8 +236,27 @@ type Tunnel struct {
 
 // NewMuxServer creates a new QUIC multiplexing server
 func NewMuxServer(config MuxServerConfig) *MuxServer {
+	// Apply defaults
 	if config.QUICConfig == nil {
 		config.QUICConfig = DefaultConfig()
+	}
+	if config.MaxTunnels <= 0 {
+		config.MaxTunnels = 10000
+	}
+	if config.MaxConnsPerTunnel <= 0 {
+		config.MaxConnsPerTunnel = 1000
+	}
+	if config.TunnelTimeout <= 0 {
+		config.TunnelTimeout = 5 * time.Minute
+	}
+	if config.ConnTimeout <= 0 {
+		config.ConnTimeout = 10 * time.Minute
+	}
+	if config.PortRangeStart <= 0 {
+		config.PortRangeStart = 10000
+	}
+	if config.PortRangeEnd <= 0 {
+		config.PortRangeEnd = 20000
 	}
 
 	// Create circuit breaker for connection handling
@@ -396,11 +416,15 @@ func (s *MuxServer) handleControlStream(conn quic.Connection, stream quic.Stream
 	// Parse register payload
 	tunnelID, protocol, localAddr, authToken, err := parseRegisterPayload(msg.Payload)
 	if err != nil {
+		log.Printf("[MuxServer] Parse register payload failed: %v", err)
 		s.sendRegisterAck(stream, "", "", 0, err.Error())
 		return
 	}
 
+	log.Printf("[MuxServer] Register request: tunnelID=%s, protocol=0x%02x, localAddr=%s, authTokenLen=%d", tunnelID, protocol, localAddr, len(authToken))
+
 	// Authenticate
+	log.Printf("[MuxServer] Checking auth: serverToken=%v, clientToken=%v", s.config.AuthToken != "", authToken != "")
 	if s.config.AuthToken != "" {
 		// Use constant-time comparison to prevent timing attacks
 		authTokenBytes := []byte(authToken)
@@ -429,14 +453,23 @@ func (s *MuxServer) handleControlStream(conn quic.Connection, stream quic.Stream
 	var publicURL string
 	var port int
 
-	if protocol == ProtocolTCP {
+	switch protocol {
+	case ProtocolTCP:
 		port, err = s.portManager.Allocate()
 		if err != nil {
 			s.sendRegisterAck(stream, tunnelID, "", 0, err.Error())
 			return
 		}
 		publicURL = fmt.Sprintf("tcp://:%d", port)
-	} else {
+	case ProtocolQUIC:
+		// For QUIC tunnel, allocate a UDP port for external QUIC listener
+		port, err = s.portManager.Allocate()
+		if err != nil {
+			s.sendRegisterAck(stream, tunnelID, "", 0, err.Error())
+			return
+		}
+		publicURL = fmt.Sprintf("quic://:%d", port)
+	default:
 		publicURL = fmt.Sprintf("https://%s.example.com", tunnelID)
 	}
 
@@ -474,6 +507,12 @@ func (s *MuxServer) handleControlStream(conn quic.Connection, stream quic.Stream
 		go s.startExternalListener(tunnel)
 	}
 
+	// Start external QUIC listener for QUIC tunnel
+	if protocol == ProtocolQUIC && port > 0 {
+		s.wg.Add(1)
+		go s.startExternalQUICListener(tunnel)
+	}
+
 	// Start data stream acceptor
 	s.wg.Add(1)
 	go s.acceptDataStreams(tunnel)
@@ -496,9 +535,12 @@ func (s *MuxServer) controlLoop(tunnel *Tunnel) {
 
 		n, err := tunnel.ControlStream.Read(*buf)
 		if err != nil {
-			if tunnel.ctx.Err() == nil {
-				log.Printf("[MuxServer] Control stream error for %s: %v", tunnel.ID, err)
+			if tunnel.ctx.Err() != nil {
+				return // Context cancelled, exit gracefully
 			}
+			// Log error but don't close tunnel immediately on EOF
+			// The tunnel might be waiting for more data
+			log.Printf("[MuxServer] Control stream error for %s: %v", tunnel.ID, err)
 			s.closeTunnel(tunnel)
 			return
 		}
@@ -622,6 +664,200 @@ func (s *MuxServer) startExternalListener(tunnel *Tunnel) {
 		s.wg.Add(1)
 		go s.handleExternalConnection(tunnel, extConn)
 	}
+}
+
+// startExternalQUICListener starts external QUIC listener for pure QUIC tunnel
+// This listener accepts QUIC connections from external users and forwards them
+// through the tunnel to the internal QUIC service
+func (s *MuxServer) startExternalQUICListener(tunnel *Tunnel) {
+	defer s.wg.Done()
+
+	log.Printf("[MuxServer] Starting external QUIC listener for tunnel %s on port %d", tunnel.ID, tunnel.Port)
+
+	// Create UDP listener for external QUIC connections
+	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", tunnel.Port))
+	if err != nil {
+		log.Printf("[MuxServer] Resolve UDP address failed for port %d: %v", tunnel.Port, err)
+		return
+	}
+
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Printf("[MuxServer] Listen UDP port %d failed: %v", tunnel.Port, err)
+		return
+	}
+	defer udpConn.Close()
+
+	// Create QUIC listener for external connections
+	// Use a separate TLS config for external QUIC
+	externalTLSConfig := s.config.TLSConfig
+	if externalTLSConfig == nil {
+		log.Printf("[MuxServer] No TLS config for external QUIC listener")
+		return
+	}
+	// Clone if needed
+	externalTLSConfig = externalTLSConfig.Clone()
+
+	externalListener, err := quic.Listen(udpConn, externalTLSConfig, s.config.QUICConfig)
+	if err != nil {
+		log.Printf("[MuxServer] Listen external QUIC failed: %v", err)
+		return
+	}
+	defer externalListener.Close()
+
+	log.Printf("[MuxServer] External QUIC listener started for %s on :%d", tunnel.ID, tunnel.Port)
+
+	for {
+		select {
+		case <-tunnel.ctx.Done():
+			return
+		default:
+		}
+
+		// Accept external QUIC connection
+		extConn, err := externalListener.Accept(tunnel.ctx)
+		if err != nil {
+			if tunnel.ctx.Err() != nil {
+				return
+			}
+			log.Printf("[MuxServer] Accept external QUIC failed: %v", err)
+			continue
+		}
+
+		s.wg.Add(1)
+		go s.handleExternalQUICConnection(tunnel, extConn)
+	}
+}
+
+// handleExternalQUICConnection handles an external QUIC connection
+// It forwards streams from the external QUIC connection through the tunnel
+func (s *MuxServer) handleExternalQUICConnection(tunnel *Tunnel, extConn quic.Connection) {
+	defer s.wg.Done()
+	defer extConn.CloseWithError(0, "connection closed")
+
+	// Check connection limit
+	if err := s.connLimiter.Acquire(); err != nil {
+		log.Printf("[MuxServer] Connection limit exceeded, rejecting QUIC connection: %v", err)
+		return
+	}
+	defer s.connLimiter.Release()
+
+	connID := generateID()
+	s.activeConns.Add(1)
+	s.totalConns.Add(1)
+
+	log.Printf("[MuxServer] New external QUIC connection: %s from %s", connID, extConn.RemoteAddr())
+
+	// Notify client about new QUIC connection
+	msg := buildNewConnMessage(connID, extConn.RemoteAddr().String())
+	if _, writeErr := tunnel.ControlStream.Write(msg); writeErr != nil {
+		log.Printf("[MuxServer] Write NEWCONN failed: %v", writeErr)
+		s.activeConns.Add(-1)
+		return
+	}
+
+	// Accept streams from external QUIC connection and forward through tunnel
+	for {
+		select {
+		case <-tunnel.ctx.Done():
+			return
+		default:
+		}
+
+		stream, err := extConn.AcceptStream(tunnel.ctx)
+		if err != nil {
+			if tunnel.ctx.Err() != nil {
+				return
+			}
+			log.Printf("[MuxServer] Accept stream from external QUIC failed: %v", err)
+			return
+		}
+
+		s.wg.Add(1)
+		go s.forwardQUICStream(tunnel, stream, connID)
+	}
+}
+
+// forwardQUICStream forwards a QUIC stream through the tunnel
+func (s *MuxServer) forwardQUICStream(tunnel *Tunnel, extStream quic.Stream, connID string) {
+	defer s.wg.Done()
+	defer extStream.Close()
+
+	// Open a data stream to the client
+	dataStream, err := tunnel.Conn.OpenStreamSync(tunnel.ctx)
+	if err != nil {
+		log.Printf("[MuxServer] Open data stream failed: %v", err)
+		return
+	}
+	defer dataStream.Close()
+
+	// Write stream type and connection ID
+	header := make([]byte, 3+len(connID))
+	header[0] = StreamTypeData
+	binary.BigEndian.PutUint16(header[1:3], uint16(len(connID)))
+	copy(header[3:], connID)
+
+	if _, err := dataStream.Write(header); err != nil {
+		log.Printf("[MuxServer] Write stream header failed: %v", err)
+		return
+	}
+
+	// Bidirectional forward between external stream and tunnel data stream
+	ctx, cancel := context.WithCancel(tunnel.ctx)
+	defer cancel()
+
+	buf := s.bufferPool.Get()
+	defer s.bufferPool.Put(buf)
+
+	done := make(chan struct{}, 2)
+
+	// External -> Tunnel
+	go func() {
+		defer func() {
+			cancel()
+			done <- struct{}{}
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			n, err := extStream.Read(*buf)
+			if err != nil {
+				return
+			}
+			if _, err := dataStream.Write((*buf)[:n]); err != nil {
+				return
+			}
+			s.bytesOut.Add(int64(n))
+		}
+	}()
+
+	// Tunnel -> External
+	go func() {
+		defer func() {
+			cancel()
+			done <- struct{}{}
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			n, err := dataStream.Read(*buf)
+			if err != nil {
+				return
+			}
+			if _, err := extStream.Write((*buf)[:n]); err != nil {
+				return
+			}
+			s.bytesIn.Add(int64(n))
+		}
+	}()
+
+	<-done
 }
 
 // handleExternalConnection handles external connection
@@ -941,6 +1177,9 @@ type MuxClient struct {
 	// Local connections
 	localConns sync.Map // connID -> net.Conn
 
+	// Local QUIC connections (for ProtocolQUIC)
+	localQUICConns sync.Map // connID -> quic.Connection
+
 	// Buffer pool
 	bufferPool *pool.BufferPool
 
@@ -977,6 +1216,16 @@ func NewMuxClient(config MuxClientConfig) *MuxClient {
 	}
 	if config.ReconnectInterval == 0 {
 		config.ReconnectInterval = 5 * time.Second
+	}
+	if config.TLSConfig == nil {
+		config.TLSConfig = &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"quic-tunnel"},
+		}
+	}
+	// Set default protocol to TCP if not specified
+	if config.Protocol == 0 {
+		config.Protocol = ProtocolTCP
 	}
 
 	return &MuxClient{
@@ -1079,6 +1328,8 @@ func (s *MuxClient) connectLoop() {
 
 // connect establishes connection to server
 func (s *MuxClient) connect() error {
+	log.Printf("[MuxClient] Connecting to %s...", s.config.ServerAddr)
+
 	// 1. Resolve address
 	udpAddr, err := net.ResolveUDPAddr("udp", s.config.ServerAddr)
 	if err != nil {
@@ -1092,7 +1343,15 @@ func (s *MuxClient) connect() error {
 	}
 
 	// 3. Dial QUIC
-	tlsConf := s.config.TLSConfig.Clone()
+	tlsConf := s.config.TLSConfig
+	if tlsConf == nil {
+		tlsConf = &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"quic-tunnel"},
+		}
+	} else {
+		tlsConf = tlsConf.Clone()
+	}
 	if len(tlsConf.NextProtos) == 0 {
 		tlsConf.NextProtos = []string{"quic-tunnel"}
 	}
@@ -1107,6 +1366,7 @@ func (s *MuxClient) connect() error {
 			return fmt.Errorf("dial QUIC failed: %w", err)
 		}
 	}
+	log.Printf("[MuxClient] QUIC connection established")
 	s.connMu.Lock()
 	s.conn = conn
 	s.connMu.Unlock()
@@ -1118,6 +1378,7 @@ func (s *MuxClient) connect() error {
 		return fmt.Errorf("open control stream failed: %w", err)
 	}
 	s.controlStream = controlStream
+	log.Printf("[MuxClient] Control stream opened")
 
 	// 5. Write stream type
 	if _, err := controlStream.Write([]byte{StreamTypeControl}); err != nil {
@@ -1128,6 +1389,7 @@ func (s *MuxClient) connect() error {
 	if err := s.sendRegister(); err != nil {
 		return fmt.Errorf("register failed: %w", err)
 	}
+	log.Printf("[MuxClient] Register message sent (protocol=0x%02x)", s.config.Protocol)
 
 	// 7. Read register ack
 	if err := s.readRegisterAck(); err != nil {
@@ -1143,6 +1405,12 @@ func (s *MuxClient) connect() error {
 	// 9. Start control message loop
 	s.wg.Add(1)
 	go s.controlLoop()
+
+	// 10. For QUIC tunnel, start data stream acceptor
+	if s.config.Protocol == ProtocolQUIC {
+		s.wg.Add(1)
+		go s.acceptQUICDataStreams()
+	}
 
 	return nil
 }
@@ -1191,7 +1459,8 @@ func (s *MuxClient) readRegisterAck() error {
 	errorLen := binary.BigEndian.Uint16(payload[offset:])
 	offset += 2
 	if errorLen > 0 {
-		return fmt.Errorf("server error: %s", string(payload[offset:offset+int(errorLen)]))
+		errMsg := string(payload[offset : offset+int(errorLen)])
+		return fmt.Errorf("server error: %s", errMsg)
 	}
 
 	return nil
@@ -1288,24 +1557,205 @@ func (s *MuxClient) handleNewConn(payload []byte) {
 
 	log.Printf("[MuxClient] New connection: %s from %s", connID, remoteAddr)
 
-	// Connect local service
-	localConn, err := net.Dial("tcp", s.config.LocalAddr)
-	if err != nil {
-		log.Printf("[MuxClient] Connect local failed: %v", err)
-		// Send close message
-		closeMsg := buildCloseConnMessage(connID)
-		s.controlStream.Write(closeMsg)
+	// Handle based on protocol type
+	switch s.config.Protocol {
+	case ProtocolQUIC:
+		// For QUIC tunnel, dial QUIC connection to local QUIC service
+		s.handleQUICNewConn(connID, remoteAddr)
+	default:
+		// For TCP/HTTP, dial TCP connection to local service
+		localConn, err := net.Dial("tcp", s.config.LocalAddr)
+		if err != nil {
+			log.Printf("[MuxClient] Connect local failed: %v", err)
+			// Send close message
+			closeMsg := buildCloseConnMessage(connID)
+			s.controlStream.Write(closeMsg)
+			return
+		}
+
+		// Save local connection
+		s.localConns.Store(connID, localConn)
+		s.activeConns.Add(1)
+		s.totalConns.Add(1)
+
+		// Start bidirectional forward
+		s.wg.Add(1)
+		go s.forwardLocalToControl(localConn, connID)
+	}
+}
+
+// handleQUICNewConn handles new QUIC connection for QUIC tunnel
+func (s *MuxClient) handleQUICNewConn(connID, remoteAddr string) {
+	// For QUIC tunnel, we need to accept streams from the server and forward to local QUIC service
+	// The server will open data streams for each stream from external QUIC client
+	// We accept these streams and forward to the local QUIC service
+
+	log.Printf("[MuxClient] QUIC connection: %s from %s, waiting for streams", connID, remoteAddr)
+
+	// Store connection info for stream handling
+	// The actual stream handling is done in handleDataStream
+}
+
+// acceptQUICDataStreams accepts data streams for QUIC tunnel and forwards to local QUIC service
+func (s *MuxClient) acceptQUICDataStreams() {
+	defer s.wg.Done()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		// Accept data stream from server
+		stream, err := s.conn.AcceptStream(s.ctx)
+		if err != nil {
+			if s.ctx.Err() != nil {
+				return
+			}
+			log.Printf("[MuxClient] Accept data stream failed: %v", err)
+			continue
+		}
+
+		s.wg.Add(1)
+		go s.handleQUICDataStream(stream)
+	}
+}
+
+// handleQUICDataStream handles a data stream for QUIC tunnel
+func (s *MuxClient) handleQUICDataStream(stream quic.Stream) {
+	defer s.wg.Done()
+	defer stream.Close()
+
+	// Read stream type
+	var streamTypeBuf [1]byte
+	if _, err := io.ReadFull(stream, streamTypeBuf[:]); err != nil {
 		return
 	}
 
-	// Save local connection
-	s.localConns.Store(connID, localConn)
-	s.activeConns.Add(1)
-	s.totalConns.Add(1)
+	if streamTypeBuf[0] != StreamTypeData {
+		return
+	}
 
-	// Start bidirectional forward
-	s.wg.Add(1)
-	go s.forwardLocalToControl(localConn, connID)
+	// Read connID length
+	var connIDLenBuf [2]byte
+	if _, err := io.ReadFull(stream, connIDLenBuf[:]); err != nil {
+		return
+	}
+
+	connIDLen := binary.BigEndian.Uint16(connIDLenBuf[:])
+	connID := make([]byte, connIDLen)
+	if _, err := io.ReadFull(stream, connID); err != nil {
+		return
+	}
+
+	connIDStr := string(connID)
+
+	// Dial local QUIC service if not already connected
+	var localConn quic.Connection
+	if stored, ok := s.localQUICConns.Load(connIDStr); ok {
+		localConn = stored.(quic.Connection)
+	} else {
+		// Dial local QUIC service
+		udpAddr, err := net.ResolveUDPAddr("udp", s.config.LocalAddr)
+		if err != nil {
+			log.Printf("[MuxClient] Resolve local QUIC address failed: %v", err)
+			return
+		}
+
+		udpConn, err := net.ListenUDP("udp", nil)
+		if err != nil {
+			log.Printf("[MuxClient] Listen UDP for local QUIC failed: %v", err)
+			return
+		}
+
+		tlsConf := s.config.TLSConfig.Clone()
+		if len(tlsConf.NextProtos) == 0 {
+			tlsConf.NextProtos = []string{"quic-tunnel"}
+		}
+
+		localConn, err = quic.Dial(s.ctx, udpConn, udpAddr, tlsConf, s.config.QUICConfig)
+		if err != nil {
+			log.Printf("[MuxClient] Dial local QUIC failed: %v", err)
+			udpConn.Close()
+			return
+		}
+
+		s.localQUICConns.Store(connIDStr, localConn)
+		s.activeConns.Add(1)
+		s.totalConns.Add(1)
+
+		// Cleanup on context done
+		go func() {
+			<-s.ctx.Done()
+			localConn.CloseWithError(0, "context done")
+		}()
+	}
+
+	// Open a stream to local QUIC service
+	localStream, err := localConn.OpenStreamSync(s.ctx)
+	if err != nil {
+		log.Printf("[MuxClient] Open local QUIC stream failed: %v", err)
+		return
+	}
+	defer localStream.Close()
+
+	// Bidirectional forward between tunnel stream and local QUIC stream
+	ctx, cancel := context.WithCancel(s.ctx)
+	defer cancel()
+
+	buf := s.bufferPool.Get()
+	defer s.bufferPool.Put(buf)
+
+	done := make(chan struct{}, 2)
+
+	// Tunnel -> Local
+	go func() {
+		defer func() {
+			cancel()
+			done <- struct{}{}
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			n, err := stream.Read(*buf)
+			if err != nil {
+				return
+			}
+			if _, err := localStream.Write((*buf)[:n]); err != nil {
+				return
+			}
+			s.bytesIn.Add(int64(n))
+		}
+	}()
+
+	// Local -> Tunnel
+	go func() {
+		defer func() {
+			cancel()
+			done <- struct{}{}
+		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			n, err := localStream.Read(*buf)
+			if err != nil {
+				return
+			}
+			if _, err := stream.Write((*buf)[:n]); err != nil {
+				return
+			}
+			s.bytesOut.Add(int64(n))
+		}
+	}()
+
+	<-done
 }
 
 // handleData handles data message
@@ -1561,8 +2011,8 @@ func parseRegisterPayload(payload []byte) (tunnelID string, protocol byte, local
 	offset++
 
 	// Validate protocol
-	if protocol != ProtocolTCP && protocol != ProtocolHTTP {
-		return "", 0, "", "", fmt.Errorf("invalid protocol: %d (expected %d or %d)", protocol, ProtocolTCP, ProtocolHTTP)
+	if protocol != ProtocolTCP && protocol != ProtocolHTTP && protocol != ProtocolQUIC {
+		return "", 0, "", "", fmt.Errorf("invalid protocol: %d (expected %d, %d or %d)", protocol, ProtocolTCP, ProtocolHTTP, ProtocolQUIC)
 	}
 
 	// Read local address

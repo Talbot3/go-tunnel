@@ -1614,9 +1614,15 @@ proxy -protocol http2 -listen :443 -target localhost:8080 \
 
 ### v1.1.1 (2026-04-16)
 
+**新功能**
+- 新增纯 QUIC 隧道支持 (`quic.ProtocolQUIC`) - 入口和后端都使用原生 QUIC 协议
+- 服务端新增 `startExternalQUICListener` 支持外部 QUIC 连接
+- 客户端新增 `acceptQUICDataStreams` 和 `handleQUICDataStream` 支持内网 QUIC 服务
+
 **文档更新**
 - 更新测试覆盖率数据，反映最新测试结果
 - 修复多路复用部分重复的代码块
+- 新增纯 QUIC 隧道使用文档和示例
 
 ### v1.1.0 (2026-04-15)
 

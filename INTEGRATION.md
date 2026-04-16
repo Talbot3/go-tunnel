@@ -830,6 +830,134 @@ stats := client.GetStats()
 // stats.Connected, stats.ActiveConns, stats.BytesIn, stats.BytesOut
 ```
 
+### 纯 QUIC 隧道（v1.1.1 新增）
+
+从 v1.1.1 开始，支持纯 QUIC 协议的内网穿透，即入口和后端服务都使用原生 QUIC 协议（非 HTTP/3）。
+
+#### 架构
+
+```
+外部用户 (QUIC 客户端) ──▶ 公网 QUIC 端口 ──▶ MuxServer ──▶ MuxClient ──▶ 内网 QUIC 服务
+         │                      │                              │
+         └── QUIC Connection ───┘                              │
+                                │                              │
+                                └── QUIC Stream (隧道) ────────┘
+```
+
+#### 使用场景
+
+- 内网 QUIC 服务需要被公网访问
+- 需要保持端到端 QUIC 语义（0-RTT、连接迁移等）
+- 对延迟敏感的实时应用
+
+#### 服务端配置
+
+```go
+// 创建 QUIC 多路复用服务器
+server := quic.NewMuxServer(quic.MuxServerConfig{
+    ListenAddr:       ":443",
+    TLSConfig:        tlsConfig,
+    AuthToken:        "secret",
+    PortRangeStart:   10000,
+    PortRangeEnd:     20000,
+    MaxTunnels:       10000,
+})
+
+// 启动服务器
+server.Start(ctx)
+```
+
+#### 客户端配置（纯 QUIC 隧道）
+
+```go
+// 创建 QUIC 客户端，指定 ProtocolQUIC
+client := quic.NewMuxClient(quic.MuxClientConfig{
+    ServerAddr:        "tunnel.example.com:443",
+    TLSConfig:         tlsConfig,
+    Protocol:          quic.ProtocolQUIC,  // 使用纯 QUIC 协议
+    LocalAddr:         "localhost:8443",   // 内网 QUIC 服务地址
+    AuthToken:         "secret",
+    ReconnectInterval: 5 * time.Second,
+})
+
+// 启动客户端
+client.Start(ctx)
+
+// 获取公网访问地址
+log.Printf("QUIC tunnel established: %s", client.PublicURL())
+// 输出: QUIC tunnel established: quic://:10001
+```
+
+#### 工作原理
+
+1. **服务端**：
+   - 收到 `ProtocolQUIC` 注册请求后，分配一个 UDP 端口
+   - 启动外部 QUIC 监听器 (`startExternalQUICListener`)
+   - 接受外部 QUIC 连接，为每个连接创建数据流转发到客户端
+
+2. **客户端**：
+   - 收到新连接通知后，建立到内网 QUIC 服务的连接
+   - 接受来自服务端的数据流，转发到内网 QUIC 服务
+   - 双向转发 QUIC 流数据
+
+#### 协议类型对比
+
+| 协议类型 | 常量 | 入口协议 | 后端协议 | 使用场景 |
+|----------|------|----------|----------|----------|
+| TCP | `ProtocolTCP` | TCP | TCP | 传统 TCP 服务 |
+| HTTP | `ProtocolHTTP` | HTTP/HTTPS | HTTP | Web 服务 |
+| QUIC | `ProtocolQUIC` | QUIC | QUIC | QUIC 原生服务 |
+
+#### 完整示例
+
+```go
+package main
+
+import (
+    "context"
+    "crypto/tls"
+    "log"
+    "os"
+    "os/signal"
+    "syscall"
+
+    "github.com/Talbot3/go-tunnel/quic"
+)
+
+func main() {
+    // TLS 配置
+    cert, _ := tls.LoadX509KeyPair("cert.pem", "key.pem")
+    tlsConfig := &tls.Config{
+        Certificates: []tls.Certificate{cert},
+        NextProtos:   []string{"quic-tunnel"},
+    }
+
+    // 创建客户端
+    client := quic.NewMuxClient(quic.MuxClientConfig{
+        ServerAddr:        os.Getenv("TUNNEL_SERVER"),
+        TLSConfig:         tlsConfig,
+        Protocol:          quic.ProtocolQUIC,
+        LocalAddr:         "localhost:8443", // 内网 QUIC 服务
+        AuthToken:         os.Getenv("TUNNEL_AUTH_TOKEN"),
+        ReconnectInterval: 5 * time.Second,
+    })
+
+    // 启动
+    if err := client.Start(context.Background()); err != nil {
+        log.Fatal(err)
+    }
+
+    log.Printf("QUIC tunnel: %s -> localhost:8443", client.PublicURL())
+
+    // 等待信号
+    sigCh := make(chan os.Signal, 1)
+    signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+    <-sigCh
+
+    client.Stop()
+}
+```
+
 ### 核心组件：forward/mux.go
 
 go-tunnel 提供了完整的多路复用组件，已集成缓冲池和背压控制优化：
