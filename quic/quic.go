@@ -225,6 +225,10 @@ type Tunnel struct {
 	// Data streams (server -> client)
 	DataStreams sync.Map // connID -> quic.Stream
 
+	// External listeners (to close them when tunnel closes)
+	externalListener     net.Listener   // TCP listener for TCP tunnels
+	externalQUICListener *quic.Listener // QUIC listener for QUIC tunnels (pointer because quic.Listener is a struct)
+
 	// Stats
 	CreatedAt  time.Time
 	LastActive atomic.Int64
@@ -642,7 +646,13 @@ func (s *MuxServer) startExternalListener(tunnel *Tunnel) {
 		log.Printf("[MuxServer] Listen port %d failed: %v", tunnel.Port, err)
 		return
 	}
-	defer listener.Close()
+
+	// Store listener so it can be closed when tunnel closes
+	tunnel.externalListener = listener
+	defer func() {
+		listener.Close()
+		tunnel.externalListener = nil
+	}()
 
 	log.Printf("[MuxServer] External listener started for %s on :%d", tunnel.ID, tunnel.Port)
 
@@ -655,7 +665,12 @@ func (s *MuxServer) startExternalListener(tunnel *Tunnel) {
 
 		extConn, err := listener.Accept()
 		if err != nil {
+			// Check if the error is due to listener being closed
 			if tunnel.ctx.Err() != nil {
+				return
+			}
+			// Check for net.ErrClosed which happens when listener.Close() is called
+			if errors.Is(err, net.ErrClosed) {
 				return
 			}
 			continue
@@ -703,7 +718,13 @@ func (s *MuxServer) startExternalQUICListener(tunnel *Tunnel) {
 		log.Printf("[MuxServer] Listen external QUIC failed: %v", err)
 		return
 	}
-	defer externalListener.Close()
+
+	// Store listener so it can be closed when tunnel closes
+	tunnel.externalQUICListener = externalListener
+	defer func() {
+		externalListener.Close()
+		tunnel.externalQUICListener = nil
+	}()
 
 	log.Printf("[MuxServer] External QUIC listener started for %s on :%d", tunnel.ID, tunnel.Port)
 
@@ -717,7 +738,12 @@ func (s *MuxServer) startExternalQUICListener(tunnel *Tunnel) {
 		// Accept external QUIC connection
 		extConn, err := externalListener.Accept(tunnel.ctx)
 		if err != nil {
+			// Check if the error is due to context cancellation or listener being closed
 			if tunnel.ctx.Err() != nil {
+				return
+			}
+			// Check for net.ErrClosed which happens when listener.Close() is called
+			if errors.Is(err, net.ErrClosed) {
 				return
 			}
 			log.Printf("[MuxServer] Accept external QUIC failed: %v", err)
@@ -1016,6 +1042,14 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 func (s *MuxServer) closeTunnel(tunnel *Tunnel) {
 	if tunnel.cancel != nil {
 		tunnel.cancel()
+	}
+
+	// Close external listeners first to unblock Accept calls
+	if tunnel.externalListener != nil {
+		tunnel.externalListener.Close()
+	}
+	if tunnel.externalQUICListener != nil {
+		tunnel.externalQUICListener.Close()
 	}
 
 	if tunnel.Conn != nil {
