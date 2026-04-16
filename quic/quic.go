@@ -210,10 +210,12 @@ func DecodeSessionHeader(data []byte) (*SessionHeader, int, error) {
 
 // Default intervals and sizes
 const (
-	defaultBufferSize      = 64 * 1024       // 64KB default buffer size
+	defaultBufferSize      = 64 * 1024        // 64KB default buffer size
 	heartbeatInterval      = 15 * time.Second // Heartbeat interval
 	healthCheckInterval    = 30 * time.Second // Health check interval
 	defaultTunnelTimeout   = 5 * time.Minute  // Default tunnel timeout
+	streamCleanupInterval  = 1 * time.Minute  // Stream cleanup check interval
+	streamIdleTimeout      = 10 * time.Minute // Stream idle timeout before cleanup
 )
 
 // Errors
@@ -225,6 +227,37 @@ var (
 	ErrTunnelNotFound      = errors.New("tunnel not found")
 	ErrConnectionClosed    = errors.New("connection closed")
 )
+
+// logError logs an error with structured context
+func logError(component, operation, tunnelID, connID string, err error) {
+	if err == nil {
+		return
+	}
+	// Check if error is a context cancellation or normal close
+	if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
+		log.Printf("[%s] %s: tunnel=%s conn=%s: closed normally", component, operation, tunnelID, connID)
+		return
+	}
+	// Check for network closed error
+	if errors.Is(err, net.ErrClosed) {
+		log.Printf("[%s] %s: tunnel=%s conn=%s: connection closed", component, operation, tunnelID, connID)
+		return
+	}
+	// Log other errors
+	log.Printf("[%s] %s ERROR: tunnel=%s conn=%s: %v", component, operation, tunnelID, connID, err)
+}
+
+// logInfo logs an info message with structured context
+func logInfo(component, operation, tunnelID, connID, message string) {
+	log.Printf("[%s] %s: tunnel=%s conn=%s: %s", component, operation, tunnelID, connID, message)
+}
+
+// logDebug logs a debug message with structured context (can be filtered by log level)
+func logDebug(component, operation, tunnelID, connID, message string) {
+	// In production, this would be controlled by a log level setting
+	// For now, we use the same log.Printf but with DEBUG prefix
+	log.Printf("[%s] %s DEBUG: tunnel=%s conn=%s: %s", component, operation, tunnelID, connID, message)
+}
 
 // constantTimeEqual performs a constant-time comparison to prevent timing attacks.
 // Returns true if the slices are equal.
@@ -337,6 +370,9 @@ type Tunnel struct {
 
 	// Data streams (server -> client)
 	DataStreams sync.Map // connID -> quic.Stream
+
+	// Stream activity tracking for cleanup
+	streamActivity sync.Map // connID -> *atomic.Int64 (Unix timestamp of last activity)
 
 	// External listeners (to close them when tunnel closes)
 	externalListener     net.Listener   // TCP listener for TCP tunnels
@@ -1173,10 +1209,23 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 		if _, loaded := tunnel.ExternalConns.LoadAndDelete(connID); loaded {
 			s.activeConns.Add(-1)
 		}
+		// Clean up activity tracking
+		tunnel.streamActivity.Delete(connID)
+		logDebug("MuxServer", "forwardBidirectional", tunnel.ID, connID, "connection closed")
 	}()
 
 	buf := s.bufferPool.Get()
 	defer s.bufferPool.Put(buf)
+
+	// Track stream activity for cleanup
+	activityTime := &atomic.Int64{}
+	activityTime.Store(time.Now().Unix())
+	tunnel.streamActivity.Store(connID, activityTime)
+
+	// Helper to update activity time
+	updateActivity := func() {
+		activityTime.Store(time.Now().Unix())
+	}
 
 	// Use a done channel with buffer size 2 to avoid blocking
 	// when both goroutines try to send after context cancellation
@@ -1196,12 +1245,15 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 			}
 			n, err := extConn.Read(*buf)
 			if err != nil {
+				logError("MuxServer", "extConn.Read", tunnel.ID, connID, err)
 				return
 			}
 			if _, err := stream.Write((*buf)[:n]); err != nil {
+				logError("MuxServer", "stream.Write", tunnel.ID, connID, err)
 				return
 			}
 			s.bytesOut.Add(int64(n))
+			updateActivity()
 		}
 	}()
 
@@ -1219,12 +1271,15 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 			}
 			n, err := stream.Read(*buf)
 			if err != nil {
+				logError("MuxServer", "stream.Read", tunnel.ID, connID, err)
 				return
 			}
 			if _, err := extConn.Write((*buf)[:n]); err != nil {
+				logError("MuxServer", "extConn.Write", tunnel.ID, connID, err)
 				return
 			}
 			s.bytesIn.Add(int64(n))
+			updateActivity()
 		}
 	}()
 
@@ -1274,12 +1329,15 @@ func (s *MuxServer) closeTunnel(tunnel *Tunnel) {
 	log.Printf("[MuxServer] Tunnel closed: %s", tunnel.ID)
 }
 
-// healthCheck performs health checks
+// healthCheck performs health checks and stream cleanup
 func (s *MuxServer) healthCheck() {
 	defer s.wg.Done()
 
 	ticker := time.NewTicker(healthCheckInterval)
 	defer ticker.Stop()
+
+	cleanupTicker := time.NewTicker(streamCleanupInterval)
+	defer cleanupTicker.Stop()
 
 	for {
 		select {
@@ -1296,8 +1354,44 @@ func (s *MuxServer) healthCheck() {
 				}
 				return true
 			})
+		case <-cleanupTicker.C:
+			// Clean up idle streams
+			s.cleanupIdleStreams()
 		}
 	}
+}
+
+// cleanupIdleStreams closes streams that have been idle for too long
+func (s *MuxServer) cleanupIdleStreams() {
+	now := time.Now().Unix()
+
+	s.tunnels.Range(func(key, value interface{}) bool {
+		tunnel := value.(*Tunnel)
+
+		tunnel.streamActivity.Range(func(key, value interface{}) bool {
+			connID := key.(string)
+			activityTime := value.(*atomic.Int64)
+			lastActive := activityTime.Load()
+
+			if now-lastActive > int64(streamIdleTimeout.Seconds()) {
+				log.Printf("[MuxServer] Closing idle stream: connID=%s, tunnelID=%s, idle=%ds",
+					connID, tunnel.ID, now-lastActive)
+
+				// Close the external connection
+				if extConn, ok := tunnel.ExternalConns.Load(connID); ok {
+					extConn.(net.Conn).Close()
+					tunnel.ExternalConns.Delete(connID)
+					s.activeConns.Add(-1)
+				}
+
+				// Clean up activity tracking
+				tunnel.streamActivity.Delete(connID)
+			}
+			return true
+		})
+
+		return true
+	})
 }
 
 // handleDatagram handles incoming DATAGRAM messages from a QUIC connection
@@ -1551,7 +1645,8 @@ type MuxClient struct {
 	connMu sync.RWMutex // Protects conn access
 
 	// Control stream
-	controlStream quic.Stream
+	controlStream   quic.Stream
+	controlStreamMu sync.RWMutex // Protects controlStream access
 
 	// Local connections
 	localConns sync.Map // connID -> net.Conn
@@ -1623,6 +1718,20 @@ func (s *MuxClient) Start(ctx context.Context) error {
 	go s.connectLoop()
 
 	return nil
+}
+
+// getControlStream returns the control stream with read lock
+func (s *MuxClient) getControlStream() quic.Stream {
+	s.controlStreamMu.RLock()
+	defer s.controlStreamMu.RUnlock()
+	return s.controlStream
+}
+
+// setControlStream sets the control stream with write lock
+func (s *MuxClient) setControlStream(stream quic.Stream) {
+	s.controlStreamMu.Lock()
+	defer s.controlStreamMu.Unlock()
+	s.controlStream = stream
 }
 
 // Stop stops the client
@@ -1763,7 +1872,7 @@ func (s *MuxClient) connect() error {
 		conn.CloseWithError(0, "failed to open control stream")
 		return fmt.Errorf("open control stream failed: %w", err)
 	}
-	s.controlStream = controlStream
+	s.setControlStream(controlStream)
 	log.Printf("[MuxClient] Control stream opened")
 
 	// 5. Write stream type
@@ -1810,14 +1919,22 @@ func (s *MuxClient) connect() error {
 // sendRegister sends register message
 func (s *MuxClient) sendRegister() error {
 	msg := buildRegisterMessage(s.config.TunnelID, s.config.Protocol, s.config.LocalAddr, s.config.AuthToken)
-	_, err := s.controlStream.Write(msg)
+	stream := s.getControlStream()
+	if stream == nil {
+		return errors.New("control stream not available")
+	}
+	_, err := stream.Write(msg)
 	return err
 }
 
 // readRegisterAck reads register ack
 func (s *MuxClient) readRegisterAck() error {
 	buf := make([]byte, 1024)
-	n, err := s.controlStream.Read(buf)
+	stream := s.getControlStream()
+	if stream == nil {
+		return errors.New("control stream not available")
+	}
+	n, err := stream.Read(buf)
 	if err != nil {
 		return err
 	}
@@ -1897,8 +2014,14 @@ func (s *MuxClient) heartbeatLoop() {
 // sendStreamHeartbeat sends heartbeat via control stream
 func (s *MuxClient) sendStreamHeartbeat() {
 	heartbeat := []byte{MsgTypeHeartbeat}
-	if _, err := s.controlStream.Write(heartbeat); err != nil {
-		log.Printf("[MuxClient] Heartbeat failed: %v", err)
+	stream := s.getControlStream()
+	if stream == nil {
+		logError("MuxClient", "sendStreamHeartbeat", s.tunnelID, "", errors.New("control stream not available"))
+		s.triggerReconnect()
+		return
+	}
+	if _, err := stream.Write(heartbeat); err != nil {
+		logError("MuxClient", "heartbeat.Write", s.tunnelID, "", err)
 		s.triggerReconnect()
 	}
 }
@@ -1957,10 +2080,15 @@ func (s *MuxClient) controlLoop() {
 		default:
 		}
 
-		n, err := s.controlStream.Read(*buf)
+		stream := s.getControlStream()
+		if stream == nil {
+			return
+		}
+
+		n, err := stream.Read(*buf)
 		if err != nil {
 			if s.ctx.Err() == nil {
-				log.Printf("[MuxClient] Control stream error: %v", err)
+				logError("MuxClient", "controlStream.Read", s.tunnelID, "", err)
 				s.triggerReconnect()
 			}
 			return
@@ -2024,7 +2152,9 @@ func (s *MuxClient) handleNewConn(payload []byte) {
 			log.Printf("[MuxClient] Connect local failed: %v", err)
 			// Send close message
 			closeMsg := BuildCloseConnMessage(connID)
-			s.controlStream.Write(closeMsg)
+			if stream := s.getControlStream(); stream != nil {
+				stream.Write(closeMsg)
+			}
 			return
 		}
 
@@ -2335,8 +2465,10 @@ func (s *MuxClient) handleConfigUpdate(payload []byte) {
 
 	// Send acknowledgment
 	ack := []byte{MsgTypeConfigAck}
-	if _, err := s.controlStream.Write(ack); err != nil {
-		log.Printf("[MuxClient] Failed to send config ack: %v", err)
+	if stream := s.getControlStream(); stream != nil {
+		if _, err := stream.Write(ack); err != nil {
+			log.Printf("[MuxClient] Failed to send config ack: %v", err)
+		}
 	}
 }
 
@@ -2351,8 +2483,10 @@ func (s *MuxClient) forwardLocalToControl(localConn net.Conn, connID string) {
 		// Only send close message if context is still valid and connected
 		if s.ctx.Err() == nil && s.connected.Load() {
 			closeMsg := BuildCloseConnMessage(connID)
-			if _, err := s.controlStream.Write(closeMsg); err != nil {
-				log.Printf("[MuxClient] Write CLOSE failed: %v", err)
+			if stream := s.getControlStream(); stream != nil {
+				if _, err := stream.Write(closeMsg); err != nil {
+					log.Printf("[MuxClient] Write CLOSE failed: %v", err)
+				}
 			}
 		}
 	}()
@@ -2385,7 +2519,12 @@ func (s *MuxClient) forwardLocalToControl(localConn net.Conn, connID string) {
 			log.Printf("[MuxClient] EncodeData error: %v", err)
 			return
 		}
-		if _, writeErr := s.controlStream.Write(encoded); writeErr != nil {
+		stream := s.getControlStream()
+		if stream == nil {
+			encoder.Release(encoded)
+			return
+		}
+		if _, writeErr := stream.Write(encoded); writeErr != nil {
 			encoder.Release(encoded)
 			return
 		}
