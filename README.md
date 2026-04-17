@@ -550,6 +550,65 @@ client.Start(context.Background())
 > - 服务端集成熔断器（防止级联故障）和连接限制器（防止资源耗尽）
 > - 客户端集成重试机制（指数退避重连）和背压控制（防止内存溢出）
 
+#### TCP 单端口多路复用
+
+TCP 单端口多路复用允许多个隧道共享同一 TCP 端口，通过域名区分不同隧道：
+
+```go
+import "github.com/Talbot3/go-tunnel/quic"
+
+// 服务端配置 - 自动启用 TCP 单端口监听
+server := quic.NewMuxServer(quic.MuxServerConfig{
+    ListenAddr:       ":443",
+    TLSConfig:        tlsConfig,
+    AuthToken:        "secret",
+    PortRangeStart:   10000,
+    PortRangeEnd:     20000,
+})
+
+// 客户端配置 - 指定域名用于路由
+client := quic.NewMuxClient(quic.MuxClientConfig{
+    ServerAddr: "tunnel.example.com:443",
+    TLSConfig:  clientTLSConfig,
+    Protocol:   quic.ProtocolTCP,
+    LocalAddr:  "localhost:8080",
+    Domain:     "app1.tunnel.com",  // 域名标识
+    AuthToken:  "secret",
+})
+```
+
+**首帧协议格式**: `[2B DomainLen][Domain][Payload...]`
+
+**SDK 工具函数**:
+
+```go
+import "github.com/Talbot3/go-tunnel/quic"
+
+// 简单连接
+conn, err := quic.DialTunnel("app1.tunnel.com", "tunnel.example.com:443")
+
+// 带初始数据连接
+conn, err := quic.DialTunnelWithPayload(
+    "app1.tunnel.com",
+    "tunnel.example.com:443",
+    []byte("GET / HTTP/1.1\r\nHost: app1.tunnel.com\r\n\r\n"),
+)
+
+// 带域名信息的连接包装
+tunnelConn, err := quic.DialTunnelConn("app1.tunnel.com", "tunnel.example.com:443")
+fmt.Println("Domain:", tunnelConn.Domain)
+```
+
+#### 协议支持矩阵
+
+| 协议 | 代码 | 入口访问 | 后端代理 |
+|------|------|----------|----------|
+| TCP | `ProtocolTCP` (0x01) | ✅ 单端口多路复用 | ✅ |
+| HTTP | `ProtocolHTTP` (0x02) | - | ✅ |
+| QUIC | `ProtocolQUIC` (0x03) | ✅ | ✅ |
+| HTTP/2 | `ProtocolHTTP2` (0x04) | - | ✅ |
+| HTTP/3 | `ProtocolHTTP3` (0x05) | ✅ | ✅ |
+
 ### 集成服务器 (server)
 
 完整的隧道服务器，集成所有高可用组件：
@@ -1611,6 +1670,23 @@ proxy -protocol http2 -listen :443 -target localhost:8080 \
 - `gopkg.in/yaml.v3` - YAML 配置解析
 
 ## 更新日志
+
+### v1.2.0 (2026-04-17)
+
+**新功能**
+- 新增 TCP 单端口多路复用支持 - 多个隧道共享同一 TCP 端口，通过域名路由
+- 新增 SDK 工具函数 (`DialTunnel`, `DialTunnelWithPayload`, `TunnelConn`) 简化客户端连接
+
+**协议支持调整**
+- 明确协议支持范围：
+  - **代理协议（后端）**: HTTP, HTTP/2, HTTP/3, QUIC
+  - **入口访问方式**: HTTP/3, QUIC, TCP（单端口多路复用）
+- 移除 UDP 协议支持，简化代码维护
+
+**改进**
+- TCP 单端口多路复用通过首帧域名标识实现多隧道共享端口
+- 服务端轻量化设计，仅做数据透传
+- 防火墙友好，只需开放单一端口
 
 ### v1.1.1 (2026-04-16)
 

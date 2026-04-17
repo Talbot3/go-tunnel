@@ -2414,7 +2414,6 @@ func TestSessionHeader_FlagConstants(t *testing.T) {
 		value    byte
 	}{
 		{"FlagKeepAlive", tunnelquic.FlagKeepAlive, 0x01},
-		{"FlagUDP_Reliable", tunnelquic.FlagUDP_Reliable, 0x02},
 		{"FlagHTTP2FrameMap", tunnelquic.FlagHTTP2FrameMap, 0x04},
 	}
 
@@ -4751,43 +4750,43 @@ func TestHandleData_Integration(t *testing.T) {
 	t.Logf("handleData integration test passed")
 }
 
-// TestUDPProtocol tests UDP protocol tunnel support
-func TestUDPProtocol(t *testing.T) {
+func TestTCPSinglePortMultiplexing(t *testing.T) {
 	cert := generateTestCertificate(t)
-	tlsConfig := &tls.Config{
+
+	// Start local echo servers for different services
+	echoListener1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to start echo server 1: %v", err)
+	}
+	defer echoListener1.Close()
+	echoAddr1 := echoListener1.Addr().String()
+	go runEchoServer(echoListener1)
+
+	echoListener2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to start echo server 2: %v", err)
+	}
+	defer echoListener2.Close()
+	echoAddr2 := echoListener2.Addr().String()
+	go runEchoServer(echoListener2)
+
+	t.Logf("Local echo servers: %s, %s", echoAddr1, echoAddr2)
+
+	// Start tunnel server
+	serverTLSConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   []string{"quic-tunnel"},
 	}
 
-	// Start a UDP echo server
-	echoAddr := "127.0.0.1:0"
-	udpEchoConn, err := net.ListenPacket("udp", echoAddr)
-	if err != nil {
-		t.Fatalf("Failed to start UDP echo server: %v", err)
-	}
-	defer udpEchoConn.Close()
-
-	// Get the actual address
-	echoAddr = udpEchoConn.LocalAddr().String()
-
-	// Start echo server goroutine
-	go func() {
-		buf := make([]byte, 1500)
-		for {
-			n, addr, err := udpEchoConn.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			udpEchoConn.WriteTo(buf[:n], addr)
-		}
-	}()
-
 	server := tunnelquic.NewMuxServer(tunnelquic.MuxServerConfig{
-		ListenAddr: "127.0.0.1:0",
-		TLSConfig:  tlsConfig,
+		ListenAddr:     "127.0.0.1:0",
+		TLSConfig:      serverTLSConfig,
+		PortRangeStart: 17000,
+		PortRangeEnd:   17100,
+		AuthToken:      "test-token",
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	if err := server.Start(ctx); err != nil {
@@ -4795,83 +4794,145 @@ func TestUDPProtocol(t *testing.T) {
 	}
 	defer server.Stop()
 
-	time.Sleep(100 * time.Millisecond)
-
 	serverAddr := server.Addr()
+	t.Logf("Tunnel server: %s", serverAddr)
 
+	// Extract port from server address for TCP connection
+	_, serverPort, err := net.SplitHostPort(serverAddr.String())
+	if err != nil {
+		t.Fatalf("Failed to parse server address: %v", err)
+	}
+	tcpAddr := fmt.Sprintf("127.0.0.1:%s", serverPort)
+	t.Logf("TCP single-port address: %s", tcpAddr)
+
+	// Start tunnel client 1 with domain "app1.tunnel.com"
 	clientTLSConfig := &tls.Config{
 		NextProtos:         []string{"quic-tunnel"},
 		InsecureSkipVerify: true,
 	}
 
-	client := tunnelquic.NewMuxClient(tunnelquic.MuxClientConfig{
+	client1 := tunnelquic.NewMuxClient(tunnelquic.MuxClientConfig{
 		ServerAddr: serverAddr.String(),
 		TLSConfig:  clientTLSConfig,
-		LocalAddr:  echoAddr,
-		Protocol:   tunnelquic.ProtocolUDP,
+		Protocol:   tunnelquic.ProtocolTCP,
+		LocalAddr:  echoAddr1,
+		Domain:     "app1.tunnel.com",
+		AuthToken:  "test-token",
 	})
 
-	if err := client.Start(ctx); err != nil {
-		t.Fatalf("Failed to start client: %v", err)
+	if err := client1.Start(ctx); err != nil {
+		t.Fatalf("Failed to start client 1: %v", err)
 	}
-	defer client.Stop()
+	defer client1.Stop()
 
-	time.Sleep(200 * time.Millisecond)
+	// Start tunnel client 2 with domain "app2.tunnel.com"
+	client2 := tunnelquic.NewMuxClient(tunnelquic.MuxClientConfig{
+		ServerAddr: serverAddr.String(),
+		TLSConfig:  clientTLSConfig,
+		Protocol:   tunnelquic.ProtocolTCP,
+		LocalAddr:  echoAddr2,
+		Domain:     "app2.tunnel.com",
+		AuthToken:  "test-token",
+	})
 
-	// Verify tunnel was registered with UDP protocol
-	publicURL := client.PublicURL()
-	if publicURL == "" {
-		t.Fatal("Expected public URL to be set")
+	if err := client2.Start(ctx); err != nil {
+		t.Fatalf("Failed to start client 2: %v", err)
+	}
+	defer client2.Stop()
+
+	// Wait for registration
+	time.Sleep(500 * time.Millisecond)
+
+	stats1 := client1.GetStats()
+	if !stats1.Connected {
+		t.Fatal("Expected client 1 to be connected")
 	}
 
-	// Extract port from URL (format: udp://:PORT)
-	_, portStr, err := net.SplitHostPort(publicURL[6:]) // Remove "udp://" prefix
+	stats2 := client2.GetStats()
+	if !stats2.Connected {
+		t.Fatal("Expected client 2 to be connected")
+	}
+
+	t.Logf("Both clients connected")
+
+	// Connect to TCP single-port and send domain-based request
+	extConn, err := net.Dial("tcp", tcpAddr)
 	if err != nil {
-		t.Fatalf("Failed to parse public URL: %v", err)
+		t.Fatalf("Failed to connect to TCP port: %v", err)
+	}
+	defer extConn.Close()
+
+	// Send first frame with domain "app1.tunnel.com"
+	domain := "app1.tunnel.com"
+	domainBytes := []byte(domain)
+	firstFrame := make([]byte, 2+len(domainBytes))
+	binary.BigEndian.PutUint16(firstFrame[0:2], uint16(len(domainBytes)))
+	copy(firstFrame[2:], domainBytes)
+
+	if _, err := extConn.Write(firstFrame); err != nil {
+		t.Fatalf("Failed to send domain frame: %v", err)
 	}
 
-	t.Logf("UDP tunnel registered: %s -> %s", client.TunnelID(), publicURL)
+	t.Logf("Sent domain frame for: %s", domain)
 
-	// Send UDP packet through the tunnel
-	extUDPConn, err := net.Dial("udp", "127.0.0.1:"+portStr)
+	// Send test data
+	testData := []byte("Hello from app1!")
+	if _, err := extConn.Write(testData); err != nil {
+		t.Fatalf("Failed to send test data: %v", err)
+	}
+
+	// Read echo response
+	response := make([]byte, len(testData))
+	extConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(extConn, response); err != nil {
+		t.Fatalf("Failed to read response: %v", err)
+	}
+
+	if string(response) != string(testData) {
+		t.Errorf("Expected echo %q, got %q", string(testData), string(response))
+	}
+
+	t.Logf("Successfully echoed through domain routing: %q", string(response))
+
+	// Test second domain
+	extConn2, err := net.Dial("tcp", tcpAddr)
 	if err != nil {
-		t.Fatalf("Failed to dial UDP tunnel: %v", err)
+		t.Fatalf("Failed to connect to TCP port for app2: %v", err)
 	}
-	defer extUDPConn.Close()
+	defer extConn2.Close()
 
-	testData := []byte("Hello UDP Tunnel!")
-	extUDPConn.SetDeadline(time.Now().Add(2 * time.Second))
+	domain2 := "app2.tunnel.com"
+	domainBytes2 := []byte(domain2)
+	firstFrame2 := make([]byte, 2+len(domainBytes2))
+	binary.BigEndian.PutUint16(firstFrame2[0:2], uint16(len(domainBytes2)))
+	copy(firstFrame2[2:], domainBytes2)
 
-	// Send packet
-	_, err = extUDPConn.Write(testData)
-	if err != nil {
-		t.Fatalf("Failed to send UDP packet: %v", err)
-	}
-
-	// Read response
-	buf := make([]byte, 1500)
-	n, err := extUDPConn.Read(buf)
-	if err != nil {
-		t.Logf("Read error (UDP tunnel may not fully forward yet): %v", err)
-	} else {
-		t.Logf("Received response: %s", string(buf[:n]))
+	if _, err := extConn2.Write(firstFrame2); err != nil {
+		t.Fatalf("Failed to send domain frame for app2: %v", err)
 	}
 
-	// Check stats
-	stats := client.GetStats()
-	t.Logf("Client stats: ActiveConns=%d, TotalConns=%d, BytesIn=%d, BytesOut=%d",
-		stats.ActiveConns, stats.TotalConns, stats.BytesIn, stats.BytesOut)
+	t.Logf("Sent domain frame for: %s", domain2)
 
-	t.Logf("UDP protocol test passed")
-}
-
-// TestUDPProtocolConstants tests UDP protocol constants
-func TestUDPProtocolConstants(t *testing.T) {
-	if tunnelquic.ProtocolUDP != 0x06 {
-		t.Errorf("Expected ProtocolUDP = 0x06, got 0x%02x", tunnelquic.ProtocolUDP)
+	testData2 := []byte("Hello from app2!")
+	if _, err := extConn2.Write(testData2); err != nil {
+		t.Fatalf("Failed to send test data for app2: %v", err)
 	}
 
-	if tunnelquic.FlagUDP_Reliable != 0x02 {
-		t.Errorf("Expected FlagUDP_Reliable = 0x02, got 0x%02x", tunnelquic.FlagUDP_Reliable)
+	response2 := make([]byte, len(testData2))
+	extConn2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.ReadFull(extConn2, response2); err != nil {
+		t.Fatalf("Failed to read response for app2: %v", err)
 	}
+
+	if string(response2) != string(testData2) {
+		t.Errorf("Expected echo %q, got %q", string(testData2), string(response2))
+	}
+
+	t.Logf("Successfully echoed through domain routing for app2: %q", string(response2))
+
+	// Check server stats
+	serverStats := server.GetStats()
+	t.Logf("Server stats: ActiveTunnels=%d, ActiveConns=%d", serverStats.ActiveTunnels, serverStats.ActiveConns)
+
+	t.Logf("TCP single-port multiplexing test passed")
 }
