@@ -449,8 +449,9 @@ type Tunnel struct {
 	streamActivity sync.Map // connID -> *atomic.Int64 (Unix timestamp of last activity)
 
 	// External listeners (to close them when tunnel closes)
-	externalListener     net.Listener   // TCP listener for TCP tunnels
-	externalQUICListener *quic.Listener // QUIC listener for QUIC tunnels (pointer because quic.Listener is a struct)
+	externalListenerMu    sync.RWMutex   // Protects externalListener and externalQUICListener
+	externalListener      net.Listener   // TCP listener for TCP tunnels
+	externalQUICListener  *quic.Listener // QUIC listener for QUIC tunnels (pointer because quic.Listener is a struct)
 
 	// Stats
 	CreatedAt  time.Time
@@ -1238,10 +1239,14 @@ func (s *MuxServer) startExternalListener(tunnel *Tunnel) {
 	}
 
 	// Store listener so it can be closed when tunnel closes
+	tunnel.externalListenerMu.Lock()
 	tunnel.externalListener = listener
+	tunnel.externalListenerMu.Unlock()
 	defer func() {
 		listener.Close()
+		tunnel.externalListenerMu.Lock()
 		tunnel.externalListener = nil
+		tunnel.externalListenerMu.Unlock()
 	}()
 
 	log.Printf("[MuxServer] External listener started for %s on :%d", tunnel.ID, tunnel.Port)
@@ -1310,10 +1315,14 @@ func (s *MuxServer) startExternalQUICListener(tunnel *Tunnel) {
 	}
 
 	// Store listener so it can be closed when tunnel closes
+	tunnel.externalListenerMu.Lock()
 	tunnel.externalQUICListener = externalListener
+	tunnel.externalListenerMu.Unlock()
 	defer func() {
 		externalListener.Close()
+		tunnel.externalListenerMu.Lock()
 		tunnel.externalQUICListener = nil
+		tunnel.externalListenerMu.Unlock()
 	}()
 
 	log.Printf("[MuxServer] External QUIC listener started for %s on :%d", tunnel.ID, tunnel.Port)
@@ -1428,10 +1437,10 @@ func (s *MuxServer) forwardQUICStream(tunnel *Tunnel, extStream quic.Stream, con
 
 	// Bidirectional forward between external stream and tunnel data stream
 	ctx, cancel := context.WithCancel(tunnel.ctx)
-	defer cancel()
 
-	buf := s.bufferPool.Get()
-	defer s.bufferPool.Put(buf)
+	// Use separate buffers for each direction to avoid race condition
+	bufIn := s.bufferPool.Get()
+	bufOut := s.bufferPool.Get()
 
 	done := make(chan struct{}, 2)
 
@@ -1447,11 +1456,11 @@ func (s *MuxServer) forwardQUICStream(tunnel *Tunnel, extStream quic.Stream, con
 				return
 			default:
 			}
-			n, err := extStream.Read(*buf)
+			n, err := extStream.Read(*bufOut)
 			if err != nil {
 				return
 			}
-			if _, err := dataStream.Write((*buf)[:n]); err != nil {
+			if _, err := dataStream.Write((*bufOut)[:n]); err != nil {
 				return
 			}
 			s.bytesOut.Add(int64(n))
@@ -1470,18 +1479,25 @@ func (s *MuxServer) forwardQUICStream(tunnel *Tunnel, extStream quic.Stream, con
 				return
 			default:
 			}
-			n, err := dataStream.Read(*buf)
+			n, err := dataStream.Read(*bufIn)
 			if err != nil {
 				return
 			}
-			if _, err := extStream.Write((*buf)[:n]); err != nil {
+			if _, err := extStream.Write((*bufIn)[:n]); err != nil {
 				return
 			}
 			s.bytesIn.Add(int64(n))
 		}
 	}()
 
+	// Wait for both directions to complete before returning buffers to pool
 	<-done
+	<-done
+	cancel()
+	extStream.Close()
+	dataStream.Close()
+	s.bufferPool.Put(bufIn)
+	s.bufferPool.Put(bufOut)
 }
 
 // startExternalHTTP3Listener starts external HTTP/3 listener for HTTP/3 tunnel
@@ -1525,10 +1541,14 @@ func (s *MuxServer) startExternalHTTP3Listener(tunnel *Tunnel) {
 	}
 
 	// Store listener so it can be closed when tunnel closes
+	tunnel.externalListenerMu.Lock()
 	tunnel.externalQUICListener = externalListener
+	tunnel.externalListenerMu.Unlock()
 	defer func() {
 		externalListener.Close()
+		tunnel.externalListenerMu.Lock()
 		tunnel.externalQUICListener = nil
+		tunnel.externalListenerMu.Unlock()
 	}()
 
 	log.Printf("[MuxServer] External HTTP/3 listener started for %s on :%d", tunnel.ID, tunnel.Port)
@@ -1779,6 +1799,10 @@ func (s *MuxServer) forwardExternalToControl(tunnel *Tunnel, extConn net.Conn, c
 func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, connID string, tunnel *Tunnel) {
 	ctx, cancel := context.WithCancel(tunnel.ctx)
 
+	// Use separate buffers for each direction to avoid race condition
+	bufIn := s.bufferPool.Get()
+	bufOut := s.bufferPool.Get()
+
 	defer func() {
 		cancel() // Signal both goroutines to stop
 		extConn.Close()
@@ -1790,11 +1814,11 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 		}
 		// Clean up activity tracking
 		tunnel.streamActivity.Delete(connID)
+		// Return buffers after goroutines are done
+		s.bufferPool.Put(bufIn)
+		s.bufferPool.Put(bufOut)
 		logDebug("MuxServer", "forwardBidirectional", tunnel.ID, connID, "connection closed")
 	}()
-
-	buf := s.bufferPool.Get()
-	defer s.bufferPool.Put(buf)
 
 	// Track stream activity for cleanup
 	activityTime := &atomic.Int64{}
@@ -1822,12 +1846,12 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 				return
 			default:
 			}
-			n, err := extConn.Read(*buf)
+			n, err := extConn.Read(*bufIn)
 			if err != nil {
 				logError("MuxServer", "extConn.Read", tunnel.ID, connID, err)
 				return
 			}
-			if _, err := stream.Write((*buf)[:n]); err != nil {
+			if _, err := stream.Write((*bufIn)[:n]); err != nil {
 				logError("MuxServer", "stream.Write", tunnel.ID, connID, err)
 				return
 			}
@@ -1848,12 +1872,12 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 				return
 			default:
 			}
-			n, err := stream.Read(*buf)
+			n, err := stream.Read(*bufOut)
 			if err != nil {
 				logError("MuxServer", "stream.Read", tunnel.ID, connID, err)
 				return
 			}
-			if _, err := extConn.Write((*buf)[:n]); err != nil {
+			if _, err := extConn.Write((*bufOut)[:n]); err != nil {
 				logError("MuxServer", "extConn.Write", tunnel.ID, connID, err)
 				return
 			}
@@ -1862,7 +1886,8 @@ func (s *MuxServer) forwardBidirectional(extConn net.Conn, stream quic.Stream, c
 		}
 	}()
 
-	// Wait for either direction to complete (the other will be cancelled via context)
+	// Wait for both directions to complete
+	<-done
 	<-done
 }
 
@@ -1873,12 +1898,16 @@ func (s *MuxServer) closeTunnel(tunnel *Tunnel) {
 	}
 
 	// Close external listeners first to unblock Accept calls
+	tunnel.externalListenerMu.Lock()
 	if tunnel.externalListener != nil {
 		tunnel.externalListener.Close()
+		tunnel.externalListener = nil
 	}
 	if tunnel.externalQUICListener != nil {
 		tunnel.externalQUICListener.Close()
+		tunnel.externalQUICListener = nil
 	}
+	tunnel.externalListenerMu.Unlock()
 
 	if tunnel.Conn != nil {
 		tunnel.Conn.CloseWithError(0, "tunnel closed")
@@ -2289,6 +2318,7 @@ type MuxClient struct {
 	bp *backpressure.Controller
 
 	// Tunnel info
+	stateMu   sync.RWMutex // Protects tunnelID and publicURL
 	tunnelID  string
 	publicURL string
 
@@ -2728,13 +2758,19 @@ func (s *MuxClient) readRegisterAck() error {
 
 	tunnelIDLen := binary.BigEndian.Uint16(payload[offset:])
 	offset += 2
-	s.tunnelID = string(payload[offset : offset+int(tunnelIDLen)])
+	tunnelID := string(payload[offset : offset+int(tunnelIDLen)])
 	offset += int(tunnelIDLen)
 
 	publicURLLen := binary.BigEndian.Uint16(payload[offset:])
 	offset += 2
-	s.publicURL = string(payload[offset : offset+int(publicURLLen)])
+	publicURL := string(payload[offset : offset+int(publicURLLen)])
 	offset += int(publicURLLen)
+
+	// Update state with lock protection
+	s.stateMu.Lock()
+	s.tunnelID = tunnelID
+	s.publicURL = publicURL
+	s.stateMu.Unlock()
 
 	// Skip port
 	offset += 2
@@ -3117,23 +3153,28 @@ func (s *MuxClient) handleTCPDataStreamForward(stream quic.Stream, connIDStr, ta
 		log.Printf("[MuxClient] Dial local TCP failed: %v", err)
 		return
 	}
-	defer localConn.Close()
+
+	// Use separate buffers for each direction to avoid race condition
+	bufIn := s.bufferPool.Get()
+	bufOut := s.bufferPool.Get()
+
+	defer func() {
+		localConn.Close()
+		s.localConns.Delete(connIDStr)
+		s.activeConns.Add(-1)
+		// Return buffers after goroutines are done
+		s.bufferPool.Put(bufIn)
+		s.bufferPool.Put(bufOut)
+	}()
 
 	// Save local connection
 	s.localConns.Store(connIDStr, localConn)
 	s.activeConns.Add(1)
 	s.totalConns.Add(1)
-	defer func() {
-		s.localConns.Delete(connIDStr)
-		s.activeConns.Add(-1)
-	}()
 
 	// Bidirectional forward between tunnel stream and local TCP connection
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
-
-	buf := s.bufferPool.Get()
-	defer s.bufferPool.Put(buf)
 
 	done := make(chan struct{}, 2)
 
@@ -3149,11 +3190,11 @@ func (s *MuxClient) handleTCPDataStreamForward(stream quic.Stream, connIDStr, ta
 				return
 			default:
 			}
-			n, err := stream.Read(*buf)
+			n, err := stream.Read(*bufIn)
 			if err != nil {
 				return
 			}
-			if _, err := localConn.Write((*buf)[:n]); err != nil {
+			if _, err := localConn.Write((*bufIn)[:n]); err != nil {
 				return
 			}
 			s.bytesIn.Add(int64(n))
@@ -3172,17 +3213,19 @@ func (s *MuxClient) handleTCPDataStreamForward(stream quic.Stream, connIDStr, ta
 				return
 			default:
 			}
-			n, err := localConn.Read(*buf)
+			n, err := localConn.Read(*bufOut)
 			if err != nil {
 				return
 			}
-			if _, err := stream.Write((*buf)[:n]); err != nil {
+			if _, err := stream.Write((*bufOut)[:n]); err != nil {
 				return
 			}
 			s.bytesOut.Add(int64(n))
 		}
 	}()
 
+	// Wait for both directions to complete
+	<-done
 	<-done
 }
 
@@ -3241,8 +3284,9 @@ func (s *MuxClient) handleQUICDataStreamForward(stream quic.Stream, connIDStr, t
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
 
-	buf := s.bufferPool.Get()
-	defer s.bufferPool.Put(buf)
+	// Use separate buffers for each direction to avoid race condition
+	bufIn := s.bufferPool.Get()
+	bufOut := s.bufferPool.Get()
 
 	done := make(chan struct{}, 2)
 
@@ -3258,11 +3302,11 @@ func (s *MuxClient) handleQUICDataStreamForward(stream quic.Stream, connIDStr, t
 				return
 			default:
 			}
-			n, err := stream.Read(*buf)
+			n, err := stream.Read(*bufIn)
 			if err != nil {
 				return
 			}
-			if _, err := localStream.Write((*buf)[:n]); err != nil {
+			if _, err := localStream.Write((*bufIn)[:n]); err != nil {
 				return
 			}
 			s.bytesIn.Add(int64(n))
@@ -3281,18 +3325,24 @@ func (s *MuxClient) handleQUICDataStreamForward(stream quic.Stream, connIDStr, t
 				return
 			default:
 			}
-			n, err := localStream.Read(*buf)
+			n, err := localStream.Read(*bufOut)
 			if err != nil {
 				return
 			}
-			if _, err := stream.Write((*buf)[:n]); err != nil {
+			if _, err := stream.Write((*bufOut)[:n]); err != nil {
 				return
 			}
 			s.bytesOut.Add(int64(n))
 		}
 	}()
 
+	// Wait for both directions to complete
 	<-done
+	<-done
+
+	// Return buffers after goroutines are done
+	s.bufferPool.Put(bufIn)
+	s.bufferPool.Put(bufOut)
 }
 
 // handleData handles data message
@@ -3461,6 +3511,8 @@ type ClientStats struct {
 
 // SaveTunnelState returns the current tunnel state for caching
 func (s *MuxClient) SaveTunnelState() *TunnelState {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
 	return &TunnelState{
 		TunnelID:  s.tunnelID,
 		Protocol:  s.config.Protocol,
@@ -3472,11 +3524,15 @@ func (s *MuxClient) SaveTunnelState() *TunnelState {
 
 // hasCachedState checks if we have cached tunnel state for 0-RTT
 func (s *MuxClient) hasCachedState() bool {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
 	return s.tunnelID != "" && s.publicURL != ""
 }
 
 // RestoreFromState restores tunnel configuration from cached state
 func (s *MuxClient) RestoreFromState(state *TunnelState) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	if state.TunnelID != "" {
 		s.tunnelID = state.TunnelID
 	}
@@ -3487,11 +3543,15 @@ func (s *MuxClient) RestoreFromState(state *TunnelState) {
 
 // PublicURL returns the public URL
 func (s *MuxClient) PublicURL() string {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
 	return s.publicURL
 }
 
 // TunnelID returns the tunnel ID
 func (s *MuxClient) TunnelID() string {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
 	return s.tunnelID
 }
 
