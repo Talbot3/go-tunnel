@@ -621,7 +621,6 @@ server := quic.NewMuxServer(quic.MuxServerConfig{
         EnableHTTP3:    true,  // HTTP/3 入口 (ALPN "h3")
         EnableQUIC:     true,  // QUIC+TLS 入口 (ALPN "quic-tunnel")
         EnableTCPTLS:   true,  // TCP+TLS 入口
-        EnableTCP:      false, // 普通 TCP 入口 (不推荐，仅用于开发)
         QUICALPN:       "quic-tunnel", // 自定义 QUIC ALPN
     },
 })
@@ -632,7 +631,6 @@ server := quic.NewMuxServer(quic.MuxServerConfig{
 - **HTTP/3**: 通过 ALPN "h3" 协商，适用于浏览器和 HTTP 客户端
 - **QUIC+TLS**: 通过 ALPN "quic-tunnel" 协商，适用于高性能隧道客户端
 - **TCP+TLS**: TLS 握手后通过首帧域名路由，适用于需要 TCP 直连的场景
-- **TCP**: 无 TLS，仅用于开发测试，不推荐生产使用
 
 ### 集成服务器 (server)
 

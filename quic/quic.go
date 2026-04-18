@@ -351,10 +351,7 @@ type EntryProtocolConfig struct {
 	// Enable TCP+TLS entry
 	EnableTCPTLS bool
 
-	// Enable plain TCP entry (no TLS, for development only)
-	EnableTCP bool
-
-	// Custom ALPN for QUIC entry (default: "quic")
+	// Custom ALPN for QUIC entry (default: "quic-tunnel")
 	QUICALPN string
 }
 
@@ -394,7 +391,6 @@ func DefaultEntryProtocolConfig() EntryProtocolConfig {
 		EnableHTTP3:    true,
 		EnableQUIC:     true,
 		EnableTCPTLS:   true,
-		EnableTCP:      false, // Disabled by default for security
 		QUICALPN:       "quic-tunnel", // Match existing client ALPN for backward compatibility
 	}
 }
@@ -424,9 +420,8 @@ type MuxServer struct {
 	// Domain to tunnel mapping for single-port multiplexing
 	tunnelByDomain sync.Map // domain -> *Tunnel
 
-	// TCP listeners for domain-based routing
-	tcpListener    net.Listener // Plain TCP listener
-	tcpTLSListener net.Listener // TCP+TLS listener
+	// TCP+TLS listener for domain-based routing
+	tcpTLSListener net.Listener
 
 	// Port management
 	portManager *PortManager
@@ -524,12 +519,12 @@ func NewMuxServer(config MuxServerConfig) *MuxServer {
 	// Apply entry protocol defaults if not set
 	// Check if any entry protocol is explicitly enabled
 	if !config.EntryProtocols.EnableHTTP3 && !config.EntryProtocols.EnableQUIC &&
-		!config.EntryProtocols.EnableTCPTLS && !config.EntryProtocols.EnableTCP {
+		!config.EntryProtocols.EnableTCPTLS {
 		// No protocols explicitly enabled, use defaults
 		config.EntryProtocols = DefaultEntryProtocolConfig()
 	}
 	if config.EntryProtocols.QUICALPN == "" {
-		config.EntryProtocols.QUICALPN = "quic"
+		config.EntryProtocols.QUICALPN = "quic-tunnel"
 	}
 
 	// Create circuit breaker for connection handling
@@ -605,19 +600,16 @@ func (s *MuxServer) Start(ctx context.Context) error {
 	if s.config.EntryProtocols.EnableTCPTLS {
 		entryProtos = append(entryProtos, "TCP+TLS")
 	}
-	if s.config.EntryProtocols.EnableTCP {
-		entryProtos = append(entryProtos, "TCP")
-	}
 	log.Printf("[MuxServer] Listening on %s (Entry protocols: %v)", s.config.ListenAddr, entryProtos)
 
-	// 4. Listen TCP for single-port multiplexing (domain-based routing)
+	// 4. Listen TCP+TLS for single-port multiplexing (domain-based routing)
 	// Use the actual port that QUIC listener is bound to
 	quicAddr := s.listener.Addr()
 	_, port, err := net.SplitHostPort(quicAddr.String())
 	if err == nil {
 		tcpAddr := fmt.Sprintf(":%s", port)
 
-		// 4a. TCP+TLS listener (if enabled)
+		// TCP+TLS listener
 		if s.config.EntryProtocols.EnableTCPTLS && tlsConfig != nil {
 			tcpRawListener, err := net.Listen("tcp", tcpAddr)
 			if err != nil {
@@ -627,18 +619,6 @@ func (s *MuxServer) Start(ctx context.Context) error {
 				log.Printf("[MuxServer] TCP+TLS listener started on %s (single-port multiplexing)", tcpAddr)
 				s.wg.Add(1)
 				go s.acceptTCPTLSLoop()
-			}
-		}
-
-		// 4b. Plain TCP listener (if enabled, for development only)
-		if s.config.EntryProtocols.EnableTCP {
-			s.tcpListener, err = net.Listen("tcp", tcpAddr)
-			if err != nil {
-				log.Printf("[MuxServer] Warning: TCP listener on %s failed: %v", tcpAddr, err)
-			} else {
-				log.Printf("[MuxServer] TCP listener started on %s (single-port multiplexing, no TLS)", tcpAddr)
-				s.wg.Add(1)
-				go s.acceptTCPLoop()
 			}
 		}
 	}
@@ -661,9 +641,6 @@ func (s *MuxServer) Stop() error {
 	}
 	if s.listener != nil {
 		s.listener.Close()
-	}
-	if s.tcpListener != nil {
-		s.tcpListener.Close()
 	}
 	if s.tcpTLSListener != nil {
 		s.tcpTLSListener.Close()
@@ -705,33 +682,6 @@ func (s *MuxServer) acceptLoop() {
 	}
 }
 
-// acceptTCPLoop accepts TCP connections for single-port multiplexing
-// TCP connections use domain-based routing: first frame contains domain name
-// Format: [2B DomainLen][Domain][Payload...]
-func (s *MuxServer) acceptTCPLoop() {
-	defer s.wg.Done()
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
-		}
-
-		conn, err := s.tcpListener.Accept()
-		if err != nil {
-			if s.ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return
-			}
-			log.Printf("[MuxServer] TCP Accept error: %v", err)
-			continue
-		}
-
-		s.wg.Add(1)
-		go s.handleTCPConnection(conn, false) // false = no TLS
-	}
-}
-
 // acceptTCPTLSLoop accepts TCP+TLS connections for single-port multiplexing
 // After TLS handshake, connections use domain-based routing
 // Format: [2B DomainLen][Domain][Payload...]
@@ -759,17 +709,10 @@ func (s *MuxServer) acceptTCPTLSLoop() {
 	}
 }
 
-// handleTCPConnection handles TCP connection with domain-based routing
+// handleTCPConnection handles TCP+TLS connection with domain-based routing
 // First frame format: [2B DomainLen][Domain][Payload...]
-// isTLS indicates if the connection is wrapped with TLS
-func (s *MuxServer) handleTCPConnection(conn net.Conn, isTLS bool) {
+func (s *MuxServer) handleTCPConnection(conn net.Conn, _ bool) {
 	defer s.wg.Done()
-
-	// Log connection type
-	connType := "TCP"
-	if isTLS {
-		connType = "TCP+TLS"
-	}
 
 	// Set read deadline for first frame
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -777,7 +720,7 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn, isTLS bool) {
 	// Read domain length (2 bytes)
 	var domainLenBuf [2]byte
 	if _, err := io.ReadFull(conn, domainLenBuf[:]); err != nil {
-		log.Printf("[MuxServer] TCP read domain length failed: %v", err)
+		log.Printf("[MuxServer] TCP+TLS read domain length failed: %v", err)
 		conn.Close()
 		return
 	}
@@ -785,7 +728,7 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn, isTLS bool) {
 
 	// Validate domain length
 	if domainLen == 0 || domainLen > 256 {
-		log.Printf("[MuxServer] TCP invalid domain length: %d", domainLen)
+		log.Printf("[MuxServer] TCP+TLS invalid domain length: %d", domainLen)
 		conn.Close()
 		return
 	}
@@ -802,12 +745,12 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn, isTLS bool) {
 	// Clear read deadline
 	conn.SetReadDeadline(time.Time{})
 
-	log.Printf("[MuxServer] %s connection for domain: %s from %s", connType, domain, conn.RemoteAddr())
+	log.Printf("[MuxServer] TCP+TLS connection for domain: %s from %s", domain, conn.RemoteAddr())
 
 	// Look up tunnel by domain
 	tunnelValue, ok := s.tunnelByDomain.Load(domain)
 	if !ok {
-		log.Printf("[MuxServer] %s no tunnel found for domain: %s", connType, domain)
+		log.Printf("[MuxServer] TCP+TLS no tunnel found for domain: %s", domain)
 		conn.Close()
 		return
 	}
@@ -815,7 +758,7 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn, isTLS bool) {
 
 	// Check connection limit
 	if err := s.connLimiter.Acquire(); err != nil {
-		log.Printf("[MuxServer] %s connection limit exceeded: %v", connType, err)
+		log.Printf("[MuxServer] TCP+TLS connection limit exceeded: %v", err)
 		conn.Close()
 		return
 	}
@@ -826,7 +769,7 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn, isTLS bool) {
 	// Open a data stream to the client
 	dataStream, err := tunnel.Conn.OpenStreamSync(s.ctx)
 	if err != nil {
-		log.Printf("[MuxServer] %s open data stream failed: %v", connType, err)
+		log.Printf("[MuxServer] TCP+TLS open data stream failed: %v", err)
 		s.connLimiter.Release()
 		conn.Close()
 		return
@@ -834,7 +777,7 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn, isTLS bool) {
 
 	// Write stream type
 	if _, err := dataStream.Write([]byte{StreamTypeData}); err != nil {
-		log.Printf("[MuxServer] %s write stream type failed: %v", connType, err)
+		log.Printf("[MuxServer] TCP+TLS write stream type failed: %v", err)
 		dataStream.Close()
 		s.connLimiter.Release()
 		conn.Close()
@@ -849,7 +792,7 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn, isTLS bool) {
 		ConnID:   connID,
 	}
 	if _, err := dataStream.Write(header.Encode()); err != nil {
-		log.Printf("[MuxServer] %s write session header failed: %v", connType, err)
+		log.Printf("[MuxServer] TCP+TLS write session header failed: %v", err)
 		dataStream.Close()
 		s.connLimiter.Release()
 		conn.Close()
@@ -861,7 +804,7 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn, isTLS bool) {
 	s.activeConns.Add(1)
 	s.totalConns.Add(1)
 
-	log.Printf("[MuxServer] %s connection established: %s -> tunnel %s", connType, connID, tunnel.ID)
+	log.Printf("[MuxServer] TCP+TLS connection established: %s -> tunnel %s", connID, tunnel.ID)
 
 	// Bidirectional forward
 	s.forwardBidirectional(conn, dataStream, connID, tunnel)
