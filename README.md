@@ -603,11 +603,36 @@ fmt.Println("Domain:", tunnelConn.Domain)
 
 | 协议 | 代码 | 入口访问 | 后端代理 |
 |------|------|----------|----------|
-| TCP | `ProtocolTCP` (0x01) | ✅ 单端口多路复用 | ✅ |
+| TCP | `ProtocolTCP` (0x01) | ✅ TCP+TLS 单端口多路复用 | ✅ |
 | HTTP | `ProtocolHTTP` (0x02) | - | ✅ |
-| QUIC | `ProtocolQUIC` (0x03) | ✅ | ✅ |
+| QUIC | `ProtocolQUIC` (0x03) | ✅ QUIC+TLS | ✅ |
 | HTTP/2 | `ProtocolHTTP2` (0x04) | - | ✅ |
-| HTTP/3 | `ProtocolHTTP3` (0x05) | ✅ | ✅ |
+| HTTP/3 | `ProtocolHTTP3` (0x05) | ✅ HTTP/3 (ALPN "h3") | ✅ |
+
+#### 入口协议配置
+
+服务端入口支持 HTTP/3、QUIC+TLS、TCP+TLS 三种协议，通过 `EntryProtocolConfig` 配置：
+
+```go
+server := quic.NewMuxServer(quic.MuxServerConfig{
+    ListenAddr: ":443",
+    TLSConfig:  tlsConfig,
+    EntryProtocols: quic.EntryProtocolConfig{
+        EnableHTTP3:    true,  // HTTP/3 入口 (ALPN "h3")
+        EnableQUIC:     true,  // QUIC+TLS 入口 (ALPN "quic-tunnel")
+        EnableTCPTLS:   true,  // TCP+TLS 入口
+        EnableTCP:      false, // 普通 TCP 入口 (不推荐，仅用于开发)
+        QUICALPN:       "quic-tunnel", // 自定义 QUIC ALPN
+    },
+})
+```
+
+**入口协议说明**：
+
+- **HTTP/3**: 通过 ALPN "h3" 协商，适用于浏览器和 HTTP 客户端
+- **QUIC+TLS**: 通过 ALPN "quic-tunnel" 协商，适用于高性能隧道客户端
+- **TCP+TLS**: TLS 握手后通过首帧域名路由，适用于需要 TCP 直连的场景
+- **TCP**: 无 TLS，仅用于开发测试，不推荐生产使用
 
 ### 集成服务器 (server)
 
@@ -1670,6 +1695,25 @@ proxy -protocol http2 -listen :443 -target localhost:8080 \
 - `gopkg.in/yaml.v3` - YAML 配置解析
 
 ## 更新日志
+
+### v1.3.0 (2026-04-18)
+
+**入口协议增强**
+- 新增 `EntryProtocolConfig` 配置项，支持灵活配置入口协议
+- HTTP/3 入口支持 (ALPN "h3") - 与 QUIC 共用 UDP 端口
+- QUIC+TLS 入口支持 (ALPN "quic-tunnel") - 高性能隧道协议
+- TCP+TLS 入口支持 - TLS 握手后域名路由
+- 普通 TCP 入口支持 (可选，默认禁用)
+
+**协议识别**
+- 通过 ALPN 区分 HTTP/3 和 QUIC 连接
+- 支持 TLS 配置自动添加 ALPN 协议列表
+- 向后兼容现有客户端的 ALPN 配置
+
+**并发安全修复**
+- 修复 `forwardQUICStream` 双向转发的竞态条件
+- 修复 `MuxClient` 状态字段 (`tunnelID`, `publicURL`) 并发访问问题
+- 修复 `Tunnel` 外部监听器字段并发访问问题
 
 ### v1.2.0 (2026-04-17)
 

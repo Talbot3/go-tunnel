@@ -4855,12 +4855,16 @@ func TestTCPSinglePortMultiplexing(t *testing.T) {
 
 	t.Logf("Both clients connected")
 
-	// Connect to TCP single-port and send domain-based request
-	extConn, err := net.Dial("tcp", tcpAddr)
+	// Connect to TCP+TLS single-port and send domain-based request
+	// Use TLS connection since server enables TCP+TLS by default
+	tlsConn, err := tls.Dial("tcp", tcpAddr, &tls.Config{
+		InsecureSkipVerify: true,
+	})
 	if err != nil {
-		t.Fatalf("Failed to connect to TCP port: %v", err)
+		t.Fatalf("Failed to connect to TCP+TLS port: %v", err)
 	}
-	defer extConn.Close()
+	defer tlsConn.Close()
+	extConn := tlsConn
 
 	// Send first frame with domain "app1.tunnel.com"
 	domain := "app1.tunnel.com"
@@ -4894,12 +4898,15 @@ func TestTCPSinglePortMultiplexing(t *testing.T) {
 
 	t.Logf("Successfully echoed through domain routing: %q", string(response))
 
-	// Test second domain
-	extConn2, err := net.Dial("tcp", tcpAddr)
+	// Test second domain with TLS connection
+	tlsConn2, err := tls.Dial("tcp", tcpAddr, &tls.Config{
+		InsecureSkipVerify: true,
+	})
 	if err != nil {
-		t.Fatalf("Failed to connect to TCP port for app2: %v", err)
+		t.Fatalf("Failed to connect to TCP+TLS port for app2: %v", err)
 	}
-	defer extConn2.Close()
+	defer tlsConn2.Close()
+	extConn2 := tlsConn2
 
 	domain2 := "app2.tunnel.com"
 	domainBytes2 := []byte(domain2)

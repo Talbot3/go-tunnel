@@ -340,6 +340,24 @@ func constantTimeEqual(a, b []byte) bool {
 // MuxServer - QUIC Multiplexing Server
 // ============================================
 
+// EntryProtocolConfig defines entry protocol configuration
+type EntryProtocolConfig struct {
+	// Enable HTTP/3 entry (ALPN "h3")
+	EnableHTTP3 bool
+
+	// Enable QUIC+TLS entry (ALPN "quic" or custom)
+	EnableQUIC bool
+
+	// Enable TCP+TLS entry
+	EnableTCPTLS bool
+
+	// Enable plain TCP entry (no TLS, for development only)
+	EnableTCP bool
+
+	// Custom ALPN for QUIC entry (default: "quic")
+	QUICALPN string
+}
+
 // MuxServerConfig server configuration
 type MuxServerConfig struct {
 	// Network
@@ -350,6 +368,9 @@ type MuxServerConfig struct {
 
 	// QUIC
 	QUICConfig *quic.Config
+
+	// Entry protocols configuration
+	EntryProtocols EntryProtocolConfig
 
 	// Authentication
 	AuthToken string
@@ -367,6 +388,17 @@ type MuxServerConfig struct {
 	ConnTimeout   time.Duration
 }
 
+// DefaultEntryProtocolConfig returns default entry protocol config
+func DefaultEntryProtocolConfig() EntryProtocolConfig {
+	return EntryProtocolConfig{
+		EnableHTTP3:    true,
+		EnableQUIC:     true,
+		EnableTCPTLS:   true,
+		EnableTCP:      false, // Disabled by default for security
+		QUICALPN:       "quic-tunnel", // Match existing client ALPN for backward compatibility
+	}
+}
+
 // DefaultMuxServerConfig returns default server config
 func DefaultMuxServerConfig() MuxServerConfig {
 	return MuxServerConfig{
@@ -377,6 +409,7 @@ func DefaultMuxServerConfig() MuxServerConfig {
 		TunnelTimeout:    5 * time.Minute,
 		ConnTimeout:      10 * time.Minute,
 		QUICConfig:       DefaultConfig(),
+		EntryProtocols:   DefaultEntryProtocolConfig(),
 	}
 }
 
@@ -391,8 +424,9 @@ type MuxServer struct {
 	// Domain to tunnel mapping for single-port multiplexing
 	tunnelByDomain sync.Map // domain -> *Tunnel
 
-	// TCP single-port listener for domain-based routing
-	tcpListener net.Listener
+	// TCP listeners for domain-based routing
+	tcpListener    net.Listener // Plain TCP listener
+	tcpTLSListener net.Listener // TCP+TLS listener
 
 	// Port management
 	portManager *PortManager
@@ -487,6 +521,17 @@ func NewMuxServer(config MuxServerConfig) *MuxServer {
 		config.PortRangeEnd = 20000
 	}
 
+	// Apply entry protocol defaults if not set
+	// Check if any entry protocol is explicitly enabled
+	if !config.EntryProtocols.EnableHTTP3 && !config.EntryProtocols.EnableQUIC &&
+		!config.EntryProtocols.EnableTCPTLS && !config.EntryProtocols.EnableTCP {
+		// No protocols explicitly enabled, use defaults
+		config.EntryProtocols = DefaultEntryProtocolConfig()
+	}
+	if config.EntryProtocols.QUICALPN == "" {
+		config.EntryProtocols.QUICALPN = "quic"
+	}
+
 	// Create circuit breaker for connection handling
 	circuitConfig := circuit.Config{
 		FailureThreshold: 5,
@@ -514,7 +559,7 @@ func NewMuxServer(config MuxServerConfig) *MuxServer {
 func (s *MuxServer) Start(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 
-	// 1. Listen UDP for QUIC
+	// 1. Listen UDP for QUIC/HTTP/3
 	udpAddr, err := net.ResolveUDPAddr("udp", s.config.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("resolve address failed: %w", err)
@@ -525,36 +570,84 @@ func (s *MuxServer) Start(ctx context.Context) error {
 		return fmt.Errorf("listen UDP failed: %w", err)
 	}
 
-	// 2. Listen QUIC
-	s.listener, err = quic.Listen(udpConn, s.config.TLSConfig, s.config.QUICConfig)
+	// 2. Configure TLS with ALPN for protocol negotiation
+	tlsConfig := s.config.TLSConfig
+	if tlsConfig != nil {
+		tlsConfig = tlsConfig.Clone()
+		// Build ALPN list based on enabled protocols
+		var alpnProtos []string
+		if s.config.EntryProtocols.EnableHTTP3 {
+			alpnProtos = append(alpnProtos, "h3") // HTTP/3 ALPN
+		}
+		if s.config.EntryProtocols.EnableQUIC {
+			alpnProtos = append(alpnProtos, s.config.EntryProtocols.QUICALPN)
+		}
+		if len(alpnProtos) > 0 {
+			tlsConfig.NextProtos = alpnProtos
+		}
+	}
+
+	// 3. Listen QUIC (supports both HTTP/3 and QUIC via ALPN)
+	s.listener, err = quic.Listen(udpConn, tlsConfig, s.config.QUICConfig)
 	if err != nil {
 		udpConn.Close()
 		return fmt.Errorf("listen QUIC failed: %w", err)
 	}
 
-	log.Printf("[MuxServer] Listening on %s (QUIC)", s.config.ListenAddr)
+	// Log enabled entry protocols
+	entryProtos := make([]string, 0)
+	if s.config.EntryProtocols.EnableHTTP3 {
+		entryProtos = append(entryProtos, "HTTP/3")
+	}
+	if s.config.EntryProtocols.EnableQUIC {
+		entryProtos = append(entryProtos, "QUIC+TLS")
+	}
+	if s.config.EntryProtocols.EnableTCPTLS {
+		entryProtos = append(entryProtos, "TCP+TLS")
+	}
+	if s.config.EntryProtocols.EnableTCP {
+		entryProtos = append(entryProtos, "TCP")
+	}
+	log.Printf("[MuxServer] Listening on %s (Entry protocols: %v)", s.config.ListenAddr, entryProtos)
 
-	// 3. Listen TCP for single-port multiplexing (domain-based routing)
+	// 4. Listen TCP for single-port multiplexing (domain-based routing)
 	// Use the actual port that QUIC listener is bound to
 	quicAddr := s.listener.Addr()
 	_, port, err := net.SplitHostPort(quicAddr.String())
 	if err == nil {
 		tcpAddr := fmt.Sprintf(":%s", port)
-		s.tcpListener, err = net.Listen("tcp", tcpAddr)
-		if err != nil {
-			log.Printf("[MuxServer] Warning: TCP listener on %s failed: %v (single-port TCP multiplexing disabled)", tcpAddr, err)
-		} else {
-			log.Printf("[MuxServer] TCP listener started on %s (single-port multiplexing)", tcpAddr)
-			s.wg.Add(1)
-			go s.acceptTCPLoop()
+
+		// 4a. TCP+TLS listener (if enabled)
+		if s.config.EntryProtocols.EnableTCPTLS && tlsConfig != nil {
+			tcpRawListener, err := net.Listen("tcp", tcpAddr)
+			if err != nil {
+				log.Printf("[MuxServer] Warning: TCP+TLS listener on %s failed: %v", tcpAddr, err)
+			} else {
+				s.tcpTLSListener = tls.NewListener(tcpRawListener, tlsConfig)
+				log.Printf("[MuxServer] TCP+TLS listener started on %s (single-port multiplexing)", tcpAddr)
+				s.wg.Add(1)
+				go s.acceptTCPTLSLoop()
+			}
+		}
+
+		// 4b. Plain TCP listener (if enabled, for development only)
+		if s.config.EntryProtocols.EnableTCP {
+			s.tcpListener, err = net.Listen("tcp", tcpAddr)
+			if err != nil {
+				log.Printf("[MuxServer] Warning: TCP listener on %s failed: %v", tcpAddr, err)
+			} else {
+				log.Printf("[MuxServer] TCP listener started on %s (single-port multiplexing, no TLS)", tcpAddr)
+				s.wg.Add(1)
+				go s.acceptTCPLoop()
+			}
 		}
 	}
 
-	// 4. Accept QUIC connections
+	// 5. Accept QUIC/HTTP/3 connections
 	s.wg.Add(1)
 	go s.acceptLoop()
 
-	// 5. Health check
+	// 6. Health check
 	s.wg.Add(1)
 	go s.healthCheck()
 
@@ -571,6 +664,9 @@ func (s *MuxServer) Stop() error {
 	}
 	if s.tcpListener != nil {
 		s.tcpListener.Close()
+	}
+	if s.tcpTLSListener != nil {
+		s.tcpTLSListener.Close()
 	}
 
 	// Close all tunnels
@@ -632,14 +728,48 @@ func (s *MuxServer) acceptTCPLoop() {
 		}
 
 		s.wg.Add(1)
-		go s.handleTCPConnection(conn)
+		go s.handleTCPConnection(conn, false) // false = no TLS
+	}
+}
+
+// acceptTCPTLSLoop accepts TCP+TLS connections for single-port multiplexing
+// After TLS handshake, connections use domain-based routing
+// Format: [2B DomainLen][Domain][Payload...]
+func (s *MuxServer) acceptTCPTLSLoop() {
+	defer s.wg.Done()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		default:
+		}
+
+		conn, err := s.tcpTLSListener.Accept()
+		if err != nil {
+			if s.ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("[MuxServer] TCP+TLS Accept error: %v", err)
+			continue
+		}
+
+		s.wg.Add(1)
+		go s.handleTCPConnection(conn, true) // true = with TLS
 	}
 }
 
 // handleTCPConnection handles TCP connection with domain-based routing
 // First frame format: [2B DomainLen][Domain][Payload...]
-func (s *MuxServer) handleTCPConnection(conn net.Conn) {
+// isTLS indicates if the connection is wrapped with TLS
+func (s *MuxServer) handleTCPConnection(conn net.Conn, isTLS bool) {
 	defer s.wg.Done()
+
+	// Log connection type
+	connType := "TCP"
+	if isTLS {
+		connType = "TCP+TLS"
+	}
 
 	// Set read deadline for first frame
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -672,12 +802,12 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn) {
 	// Clear read deadline
 	conn.SetReadDeadline(time.Time{})
 
-	log.Printf("[MuxServer] TCP connection for domain: %s from %s", domain, conn.RemoteAddr())
+	log.Printf("[MuxServer] %s connection for domain: %s from %s", connType, domain, conn.RemoteAddr())
 
 	// Look up tunnel by domain
 	tunnelValue, ok := s.tunnelByDomain.Load(domain)
 	if !ok {
-		log.Printf("[MuxServer] TCP no tunnel found for domain: %s", domain)
+		log.Printf("[MuxServer] %s no tunnel found for domain: %s", connType, domain)
 		conn.Close()
 		return
 	}
@@ -685,7 +815,7 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn) {
 
 	// Check connection limit
 	if err := s.connLimiter.Acquire(); err != nil {
-		log.Printf("[MuxServer] TCP connection limit exceeded: %v", err)
+		log.Printf("[MuxServer] %s connection limit exceeded: %v", connType, err)
 		conn.Close()
 		return
 	}
@@ -696,7 +826,7 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn) {
 	// Open a data stream to the client
 	dataStream, err := tunnel.Conn.OpenStreamSync(s.ctx)
 	if err != nil {
-		log.Printf("[MuxServer] TCP open data stream failed: %v", err)
+		log.Printf("[MuxServer] %s open data stream failed: %v", connType, err)
 		s.connLimiter.Release()
 		conn.Close()
 		return
@@ -704,7 +834,7 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn) {
 
 	// Write stream type
 	if _, err := dataStream.Write([]byte{StreamTypeData}); err != nil {
-		log.Printf("[MuxServer] TCP write stream type failed: %v", err)
+		log.Printf("[MuxServer] %s write stream type failed: %v", connType, err)
 		dataStream.Close()
 		s.connLimiter.Release()
 		conn.Close()
@@ -719,7 +849,7 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn) {
 		ConnID:   connID,
 	}
 	if _, err := dataStream.Write(header.Encode()); err != nil {
-		log.Printf("[MuxServer] TCP write session header failed: %v", err)
+		log.Printf("[MuxServer] %s write session header failed: %v", connType, err)
 		dataStream.Close()
 		s.connLimiter.Release()
 		conn.Close()
@@ -731,13 +861,14 @@ func (s *MuxServer) handleTCPConnection(conn net.Conn) {
 	s.activeConns.Add(1)
 	s.totalConns.Add(1)
 
-	log.Printf("[MuxServer] TCP connection established: %s -> tunnel %s", connID, tunnel.ID)
+	log.Printf("[MuxServer] %s connection established: %s -> tunnel %s", connType, connID, tunnel.ID)
 
 	// Bidirectional forward
 	s.forwardBidirectional(conn, dataStream, connID, tunnel)
 }
 
 // handleConnection handles a QUIC connection
+// Supports both HTTP/3 and QUIC protocols via ALPN negotiation
 func (s *MuxServer) handleConnection(conn quic.Connection) {
 	defer s.wg.Done()
 	defer conn.CloseWithError(0, "connection closed")
@@ -746,6 +877,42 @@ func (s *MuxServer) handleConnection(conn quic.Connection) {
 	if err := s.circuitBreaker.Allow(); err != nil {
 		log.Printf("[MuxServer] Circuit breaker open, rejecting connection: %v", err)
 		return
+	}
+
+	// Get ALPN from TLS connection state
+	alpn := ""
+	if cs := conn.ConnectionState(); cs.TLS.NegotiatedProtocol != "" {
+		alpn = cs.TLS.NegotiatedProtocol
+	}
+
+	// Log connection with ALPN
+	remoteAddr := conn.RemoteAddr().String()
+	if alpn != "" {
+		log.Printf("[MuxServer] QUIC connection from %s, ALPN: %s", remoteAddr, alpn)
+	} else {
+		log.Printf("[MuxServer] QUIC connection from %s, no ALPN", remoteAddr)
+	}
+
+	// Check if protocol is enabled
+	switch alpn {
+	case "h3":
+		if !s.config.EntryProtocols.EnableHTTP3 {
+			log.Printf("[MuxServer] HTTP/3 not enabled, rejecting connection")
+			return
+		}
+	case s.config.EntryProtocols.QUICALPN:
+		if !s.config.EntryProtocols.EnableQUIC {
+			log.Printf("[MuxServer] QUIC not enabled, rejecting connection")
+			return
+		}
+	default:
+		// Allow connections with any ALPN if QUIC is enabled
+		// This provides backward compatibility with existing clients
+		// that may use different ALPN values (e.g., "quic-tunnel")
+		if !s.config.EntryProtocols.EnableQUIC {
+			log.Printf("[MuxServer] No matching ALPN and QUIC not enabled, rejecting connection")
+			return
+		}
 	}
 
 	// Accept control stream
@@ -768,12 +935,13 @@ func (s *MuxServer) handleConnection(conn quic.Connection) {
 		return
 	}
 
-	// Handle control stream
-	s.handleControlStream(conn, stream)
+	// Handle control stream (pass ALPN for protocol-specific handling)
+	s.handleControlStream(conn, stream, alpn)
 }
 
 // handleControlStream handles the control stream
-func (s *MuxServer) handleControlStream(conn quic.Connection, stream quic.Stream) {
+// alpn indicates the negotiated protocol (e.g., "h3" for HTTP/3, "quic" for QUIC)
+func (s *MuxServer) handleControlStream(conn quic.Connection, stream quic.Stream, alpn string) {
 	defer stream.Close()
 
 	// Read register message
