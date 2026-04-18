@@ -65,10 +65,11 @@
 
 | 文档 | 说明 |
 |------|------|
+| **[docs/EXAMPLES.md](./docs/EXAMPLES.md)** | **使用示例大全** - 服务端、客户端、SDK、部署示例 |
+| [pkg.go.dev](https://pkg.go.dev/github.com/Talbot3/go-tunnel) | **API 文档** - Go 官方文档（推荐） |
 | [INTEGRATION.md](./INTEGRATION.md) | 集成部署指南 - 安全配置、监控集成 |
 | [CODE_REVIEW.md](./CODE_REVIEW.md) | 代码审查报告 - 安全评估、设计分析 |
 | [docs/MUX_DESIGN.md](./docs/MUX_DESIGN.md) | 多路复用设计 - 安全架构详解 |
-| [docs/MUX_TUNNEL_DESIGN.md](./docs/MUX_TUNNEL_DESIGN.md) | 隧道实现 - 端到端加密方案 |
 
 ## 🚀 技术核心
 
@@ -110,189 +111,57 @@ go get github.com/Talbot3/go-tunnel
 
 ## 💡 快速开始
 
-### 安全隧道服务端
+详细示例请查看 **[docs/EXAMPLES.md](./docs/EXAMPLES.md)**。
+
+### 服务端（最小示例）
 
 ```go
-package main
-
-import (
-    "context"
-    "crypto/tls"
-    "log"
-    
-    "github.com/Talbot3/go-tunnel/quic"
-)
-
-func main() {
-    // 加载 TLS 证书（生产环境建议使用 certmagic 自动管理）
-    cert, err := tls.LoadX509KeyPair("server.crt", "server.key")
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    tlsConfig := &tls.Config{
-        Certificates: []tls.Certificate{cert},
-        MinVersion:   tls.VersionTLS13, // 强制 TLS 1.3
-    }
-    
-    // 创建安全隧道服务器
-    server := quic.NewMuxServer(quic.MuxServerConfig{
-        ListenAddr: ":443",
-        TLSConfig:  tlsConfig,
-        AuthToken:  "your-secure-token", // 客户端认证令牌
-        EntryProtocols: quic.EntryProtocolConfig{
-            EnableHTTP3:  true,  // HTTP/3 入口
-            EnableQUIC:   true,  // QUIC+TLS 入口
-            EnableTCPTLS: true,  // TCP+TLS 入口
-        },
-    })
-    
-    // 启动服务
-    if err := server.Start(context.Background()); err != nil {
-        log.Fatal(err)
-    }
-    defer server.Stop()
-    
-    log.Println("安全隧道服务已启动，监听 :443")
-    select {} // 阻塞主线程
-}
-```
-
-### 安全隧道客户端
-
-```go
-package main
-
-import (
-    "context"
-    "crypto/tls"
-    "log"
-    
-    "github.com/Talbot3/go-tunnel/quic"
-)
-
-func main() {
-    // 客户端 TLS 配置
-    tlsConfig := &tls.Config{
-        InsecureSkipVerify: false, // 生产环境应验证证书
-        MinVersion:         tls.VersionTLS13,
-    }
-    
-    // 创建安全隧道客户端
-    client := quic.NewMuxClient(quic.MuxClientConfig{
-        ServerAddr: "tunnel.example.com:443",
-        TLSConfig:  tlsConfig,
-        Protocol:   quic.ProtocolTCP,
-        LocalAddr:  "127.0.0.1:8080", // 内网服务地址
-        Domain:     "app.example.com", // 域名标识
-        AuthToken:  "your-secure-token",
-    })
-    
-    // 启动客户端
-    if err := client.Start(context.Background()); err != nil {
-        log.Fatal(err)
-    }
-    defer client.Stop()
-    
-    log.Printf("隧道已建立: %s", client.PublicURL())
-    select {} // 阻塞主线程
-}
-```
-
-## 🔐 安全配置指南
-
-### TLS 证书管理
-
-**生产环境推荐使用 certmagic 自动管理：**
-
-```go
-import "github.com/caddyserver/certmagic"
-
-func main() {
-    // 自动获取和续期 Let's Encrypt 证书
-    err := certmagic.HTTPS([]string{"tunnel.example.com"}, handler)
-    if err != nil {
-        log.Fatal(err)
-    }
-}
-```
-
-### 认证配置
-
-```go
-// 服务端配置
 server := quic.NewMuxServer(quic.MuxServerConfig{
-    AuthToken: "strong-random-token-min-32-chars",
-    // ... 其他配置
+    ListenAddr: ":443",
+    TLSConfig:  tlsConfig,  // TLS 1.3 强制
+    AuthToken:  "your-secure-token",
 })
+server.Start(context.Background())
+```
 
-// 客户端配置（必须匹配服务端令牌）
+### 客户端（最小示例）
+
+```go
 client := quic.NewMuxClient(quic.MuxClientConfig{
-    AuthToken: "strong-random-token-min-32-chars",
-    // ... 其他配置
+    ServerAddr: "tunnel.example.com:443",
+    TLSConfig:  tlsConfig,
+    Protocol:   quic.ProtocolTCP,
+    LocalAddr:  "127.0.0.1:8080",
+    AuthToken:  "your-secure-token",
 })
+client.Start(context.Background())
 ```
 
-### 资源保护配置
+## 📖 API 文档
 
-```go
-server := quic.NewMuxServer(quic.MuxServerConfig{
-    MaxTunnels:       1000,  // 最大隧道数
-    MaxConnsPerTunnel: 100,  // 每隧道最大连接数
-    // ... 其他配置
-})
+### 使用 go doc 查看
+
+```bash
+# 包概览
+go doc github.com/Talbot3/go-tunnel/quic
+
+# 服务端配置
+go doc github.com/Talbot3/go-tunnel/quic.MuxServerConfig
+
+# 客户端配置
+go doc github.com/Talbot3/go-tunnel/quic.MuxClientConfig
+
+# 入口协议配置
+go doc github.com/Talbot3/go-tunnel/quic.EntryProtocolConfig
+
+# SDK 函数
+go doc github.com/Talbot3/go-tunnel/quic.DialTunnel
+go doc github.com/Talbot3/go-tunnel/quic.DialTunnelWithPayload
 ```
 
-## 🛠 核心应用场景
+### 在线文档
 
-### 1. 企业内网穿透
-
-```
-外部用户 ──HTTPS──► 隧道服务器 ──QUIC──► 内网客户端 ──► 内网服务
-                    (公网)              (内网)
-```
-
-**安全优势：**
-- 全链路 TLS 1.3 加密
-- 无需开放内网端口
-- 支持域名隔离的多租户
-
-### 2. 微服务安全网关
-
-```
-客户端 ──HTTP/3──► 隧道网关 ──► 服务网格
-                    (TLS终止)
-```
-
-**安全优势：**
-- 统一 TLS 卸载
-- 协议转换 (H3 → TCP)
-- 熔断保护后端服务
-
-### 3. 跨云安全互联
-
-```
-云A服务 ◄──QUIC隧道──► 云B服务
-        (TLS 1.3加密)
-```
-
-**安全优势：**
-- 零信任网络架构
-- 端到端加密传输
-- 支持双向认证
-
-## 📖 API 参考
-
-### 入口协议配置
-
-```go
-type EntryProtocolConfig struct {
-    EnableHTTP3  bool   // HTTP/3 入口 (ALPN "h3")
-    EnableQUIC   bool   // QUIC+TLS 入口 (ALPN "quic-tunnel")
-    EnableTCPTLS bool   // TCP+TLS 入口
-    QUICALPN     string // 自定义 QUIC ALPN
-}
-```
+- **[pkg.go.dev/github.com/Talbot3/go-tunnel](https://pkg.go.dev/github.com/Talbot3/go-tunnel)** - Go 官方包文档
 
 ### 协议支持矩阵
 
@@ -304,82 +173,42 @@ type EntryProtocolConfig struct {
 | HTTP/2 | `ProtocolHTTP2` (0x04) | - | ✅ |
 | HTTP/3 | `ProtocolHTTP3` (0x05) | ✅ HTTP/3 | ✅ |
 
-### SDK 工具函数
+## 🛠 核心应用场景
 
-```go
-// 连接到 TCP+TLS 隧道入口
-conn, err := quic.DialTunnel("app.example.com", "tunnel.example.com:443")
+### 1. 企业内网穿透
 
-// 带初始数据的连接
-conn, err := quic.DialTunnelWithPayload(
-    "app.example.com", 
-    "tunnel.example.com:443",
-    []byte("GET / HTTP/1.1\r\nHost: app.example.com\r\n\r\n"),
-)
 ```
+外部用户 ──HTTPS──► 隧道服务器 ──QUIC──► 内网客户端 ──► 内网服务
+                    (公网)              (内网)
+```
+
+**安全优势：** 全链路 TLS 1.3 加密、无需开放内网端口、支持域名隔离的多租户
+
+### 2. 微服务安全网关
+
+```
+客户端 ──HTTP/3──► 隧道网关 ──► 服务网格
+                    (TLS终止)
+```
+
+**安全优势：** 统一 TLS 卸载、协议转换 (H3 → TCP)、熔断保护后端服务
+
+### 3. 跨云安全互联
+
+```
+云A服务 ◄──QUIC隧道──► 云B服务
+        (TLS 1.3加密)
+```
+
+**安全优势：** 零信任网络架构、端到端加密传输、支持双向认证
 
 ## 🏢 企业级部署
 
-### Docker 部署
+详细部署示例请查看 **[docs/EXAMPLES.md](./docs/EXAMPLES.md)** 的企业级部署章节。
 
-```dockerfile
-FROM golang:1.22-alpine AS builder
-WORKDIR /app
-COPY . .
-RUN go build -o tunnel-server ./cmd/server
-
-FROM alpine:latest
-RUN apk --no-cache add ca-certificates
-COPY --from=builder /app/tunnel-server /usr/local/bin/
-EXPOSE 443/udp 443/tcp
-CMD ["tunnel-server"]
-```
-
-### Kubernetes 部署
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: tunnel-server
-spec:
-  replicas: 3
-  template:
-    spec:
-      containers:
-      - name: tunnel-server
-        image: tunnel-server:latest
-        ports:
-        - containerPort: 443
-          protocol: UDP
-        - containerPort: 443
-          protocol: TCP
-        resources:
-          limits:
-            memory: "512Mi"
-            cpu: "1000m"
-        livenessProbe:
-          httpGet:
-            path: /livez
-            port: 8080
-        readinessProbe:
-          httpGet:
-            path: /readyz
-            port: 8080
-```
-
-### 监控集成
-
-```go
-// Prometheus 指标端点
-http.Handle("/metrics", promhttp.Handler())
-
-// 健康检查端点
-http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-    w.WriteHeader(http.StatusOK)
-    w.Write([]byte("OK"))
-})
-```
+- Docker / Docker Compose 部署
+- Kubernetes 部署（含健康检查）
+- 监控集成（Prometheus 指标）
 
 ## 📋 合规性支持
 
