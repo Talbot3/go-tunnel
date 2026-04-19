@@ -241,6 +241,27 @@ go doc github.com/Talbot3/go-tunnel/quic.DialTunnelWithPayload
 
 ## 更新日志
 
+### v1.3.1 (2026-04-19)
+
+**🧪 测试覆盖率提升**
+- 覆盖率从 43.0% 提升到 **50.6%**
+- 新增复杂场景测试套件 (`quic_complex_test.go`)
+- 新增测试辅助函数 (`quic_helper_test.go`)
+
+**新增测试场景**
+- TCP+TLS 入口连接测试
+- 0-RTT 快速重连测试
+- QUIC 外部连接测试
+- DATAGRAM 心跳测试
+- Stream 心跳回退测试
+- 数据流处理测试
+- HTTP/3 外部连接测试
+
+**🐛 Bug 修复**
+- 修复 `handleDatagram` 在 DATAGRAM 禁用时的死循环问题
+- 修复 `handleSessionRestore` 的 goroutine 泄漏问题
+- 修复隧道关闭时的资源清理问题
+
 ### v1.3.0 (2026-04-18)
 
 **🔒 安全增强**

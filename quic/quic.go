@@ -52,6 +52,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -309,11 +310,6 @@ func logError(component, operation, tunnelID, connID string, err error) {
 	}
 	// Log other errors
 	log.Printf("[%s] %s ERROR: tunnel=%s conn=%s: %v", component, operation, tunnelID, connID, err)
-}
-
-// logInfo logs an info message with structured context
-func logInfo(component, operation, tunnelID, connID, message string) {
-	log.Printf("[%s] %s: tunnel=%s conn=%s: %s", component, operation, tunnelID, connID, message)
 }
 
 // logDebug logs a debug message with structured context (can be filtered by log level)
@@ -961,6 +957,17 @@ func (s *MuxServer) handleControlStream(conn quic.Connection, stream quic.Stream
 			return
 		}
 		publicURL = fmt.Sprintf("quic://:%d", port)
+	case ProtocolHTTP3:
+		// For HTTP/3 tunnel, allocate a UDP port for external HTTP/3 listener
+		port, err = s.portManager.Allocate()
+		if err != nil {
+			s.sendRegisterAck(stream, tunnelID, "", 0, err.Error())
+			return
+		}
+		publicURL = fmt.Sprintf("https://:%d", port)
+	case ProtocolHTTP2:
+		// For HTTP/2 tunnel, use domain-based routing
+		publicURL = fmt.Sprintf("https://%s.example.com", tunnelID)
 	default:
 		publicURL = fmt.Sprintf("https://%s.example.com", tunnelID)
 	}
@@ -1196,14 +1203,7 @@ func (s *MuxServer) handleSessionRestore(conn quic.Connection, stream quic.Strea
 	s.sendRegisterAck(stream, tunnelID, publicURL, port, "")
 	log.Printf("[MuxServer] Tunnel registered via session restore: %s -> %s", tunnelID, publicURL)
 
-	// Start tunnel handlers
-	s.wg.Add(1)
-	go s.controlLoop(tunnel)
-
-	s.wg.Add(1)
-	go s.acceptDataStreams(tunnel)
-
-	// Start external listener
+	// Start external listener first (same order as normal registration)
 	switch protocol {
 	case ProtocolTCP:
 		s.wg.Add(1)
@@ -1212,6 +1212,17 @@ func (s *MuxServer) handleSessionRestore(conn quic.Connection, stream quic.Strea
 		s.wg.Add(1)
 		go s.startExternalQUICListener(tunnel)
 	}
+
+	// Start data stream acceptor
+	s.wg.Add(1)
+	go s.acceptDataStreams(tunnel)
+
+	// Start DATAGRAM handler for lightweight signaling
+	s.wg.Add(1)
+	go s.handleDatagram(conn, tunnel)
+
+	// Control message loop (runs synchronously, blocks until tunnel closes)
+	s.controlLoop(tunnel)
 }
 
 // acceptDataStreams accepts data streams
@@ -2123,18 +2134,25 @@ func (s *MuxServer) cleanupIdleStreams() {
 func (s *MuxServer) handleDatagram(conn quic.Connection, tunnel *Tunnel) {
 	defer s.wg.Done()
 
+	// Use tunnel context for all operations to ensure proper cleanup
 	for {
 		select {
-		case <-s.ctx.Done():
-			return
 		case <-tunnel.ctx.Done():
 			return
 		default:
 		}
 
-		data, err := conn.ReceiveDatagram(s.ctx)
+		data, err := conn.ReceiveDatagram(tunnel.ctx)
 		if err != nil {
-			if s.ctx.Err() != nil || tunnel.ctx.Err() != nil {
+			// Check if context is cancelled or connection is closed
+			if tunnel.ctx.Err() != nil {
+				return
+			}
+			// Check for connection closed errors
+			errStr := err.Error()
+			if strings.Contains(errStr, "connection closed") ||
+				strings.Contains(errStr, "Application error") ||
+				strings.Contains(errStr, "datagram support disabled") {
 				return
 			}
 			log.Printf("[MuxServer] Receive DATAGRAM error: %v", err)
@@ -3776,8 +3794,8 @@ func parseRegisterPayload(payload []byte) (tunnelID string, protocol byte, local
 	offset++
 
 	// Validate protocol
-	if protocol != ProtocolTCP && protocol != ProtocolHTTP && protocol != ProtocolQUIC {
-		return "", 0, "", "", "", fmt.Errorf("invalid protocol: %d (expected %d, %d or %d)", protocol, ProtocolTCP, ProtocolHTTP, ProtocolQUIC)
+	if protocol != ProtocolTCP && protocol != ProtocolHTTP && protocol != ProtocolQUIC && protocol != ProtocolHTTP2 && protocol != ProtocolHTTP3 {
+		return "", 0, "", "", "", fmt.Errorf("invalid protocol: %d (expected %d, %d, %d, %d or %d)", protocol, ProtocolTCP, ProtocolHTTP, ProtocolQUIC, ProtocolHTTP2, ProtocolHTTP3)
 	}
 
 	// Read local address
