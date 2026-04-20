@@ -410,11 +410,13 @@ type MuxServer struct {
 	config   MuxServerConfig
 	listener *quic.Listener
 
-	// Tunnel management
-	tunnels sync.Map // tunnelID -> *Tunnel
+	// Tunnel management - using TunnelRegistry component
+	registry *TunnelRegistry
 
-	// Domain to tunnel mapping for single-port multiplexing
-	tunnelByDomain sync.Map // domain -> *Tunnel
+	// Legacy fields kept for backward compatibility
+	// These are now delegated to registry
+	tunnels       sync.Map // tunnelID -> *Tunnel (delegated to registry)
+	tunnelByDomain sync.Map // domain -> *Tunnel (delegated to registry)
 
 	// TCP+TLS listener for domain-based routing
 	tcpTLSListener net.Listener
@@ -432,6 +434,12 @@ type MuxServer struct {
 	totalConns    atomic.Int64
 	bytesIn       atomic.Int64
 	bytesOut      atomic.Int64
+
+	// Stats handler for component integration
+	statsHandler *ServerStatsHandler
+
+	// Protocol router for handling different protocols
+	protocolRouter *ProtocolRouter
 
 	// Circuit breaker for connection handling
 	circuitBreaker *circuit.Breaker
@@ -537,13 +545,41 @@ func NewMuxServer(config MuxServerConfig) *MuxServer {
 	// Create connection limiter
 	connLimiter := limiter.NewConnectionLimiter(int64(config.MaxConnsPerTunnel * config.MaxTunnels))
 
-	return &MuxServer{
+	// Create port manager
+	portManager := NewPortManager(config.PortRangeStart, config.PortRangeEnd)
+
+	// Create buffer pool
+	bufferPool := pool.NewBufferPool(defaultBufferSize)
+
+	// Create server instance
+	s := &MuxServer{
 		config:         config,
-		portManager:    NewPortManager(config.PortRangeStart, config.PortRangeEnd),
-		bufferPool:     pool.NewBufferPool(defaultBufferSize),
+		portManager:    portManager,
+		bufferPool:     bufferPool,
 		circuitBreaker: circuit.NewBreaker(circuitConfig),
 		connLimiter:    connLimiter,
 	}
+
+	// Create stats handler
+	s.statsHandler = NewServerStatsHandler(
+		&s.activeConns, &s.totalConns, &s.bytesIn, &s.bytesOut,
+		&s.activeTunnels, &s.totalTunnels,
+	)
+
+	// Create tunnel registry
+	s.registry = NewTunnelRegistry(portManager, s.statsHandler)
+
+	// Create protocol router
+	s.protocolRouter = NewProtocolRouter(ProtocolRouterConfig{
+		TLSConfig:    config.TLSConfig,
+		QUICConfig:   config.QUICConfig,
+		BufferPool:   bufferPool,
+		ConnLimiter:  connLimiter,
+		StatsHandler: s.statsHandler,
+		PortManager:  portManager,
+	})
+
+	return s
 }
 
 // Start starts the server
@@ -2457,6 +2493,12 @@ type MuxClient struct {
 	bytesIn     atomic.Int64
 	bytesOut    atomic.Int64
 
+	// Stats handler for component integration
+	statsHandler *ClientStatsHandler
+
+	// Stream handler for data stream processing
+	streamHandler *StreamHandler
+
 	// Lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -2489,17 +2531,42 @@ func NewMuxClient(config MuxClientConfig) *MuxClient {
 		config.Protocol = ProtocolTCP
 	}
 
-	return &MuxClient{
+	// Create client instance
+	c := &MuxClient{
 		config:      config,
 		bufferPool:  pool.NewBufferPool(defaultBufferSize),
 		bp:          backpressure.NewController(),
 		reconnectCh: make(chan struct{}, 1),
 	}
+
+	// Create stats handler
+	c.statsHandler = NewClientStatsHandler(
+		&c.activeConns, &c.totalConns, &c.bytesIn, &c.bytesOut,
+	)
+
+	// Create stream handler
+	c.streamHandler = NewStreamHandler(StreamHandlerConfig{
+		Conn:           func() quic.Connection { return c.conn },
+		LocalConns:     &c.localConns,
+		LocalQUICConns: &c.localQUICConns,
+		BufferPool:     c.bufferPool,
+		LocalAddr:      config.LocalAddr,
+		Protocol:       config.Protocol,
+		OnBytesIn:      func(n int) { c.bytesIn.Add(int64(n)) },
+		OnBytesOut:     func(n int) { c.bytesOut.Add(int64(n)) },
+	})
+
+	return c
 }
 
 // Start starts the client
 func (s *MuxClient) Start(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
+
+	// Set context for stream handler
+	if s.streamHandler != nil {
+		s.streamHandler.SetContext(s.ctx, &s.wg)
+	}
 
 	s.wg.Add(1)
 	go s.connectLoop()
@@ -2534,6 +2601,11 @@ func (s *MuxClient) Stop() error {
 		s.conn.CloseWithError(0, "client stopped")
 	}
 	s.connMu.Unlock()
+
+	// Close stream handler
+	if s.streamHandler != nil {
+		s.streamHandler.Close()
+	}
 
 	// Close local connections
 	s.localConns.Range(func(key, value interface{}) bool {
