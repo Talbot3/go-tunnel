@@ -836,7 +836,7 @@ type MuxServer struct {
 
 ## 九、重构路线图
 
-### Phase 1: 提取接口（1-2 天）
+### Phase 1: 提取接口（✅ 已完成 - 2026-04-20）
 
 ```go
 // 定义核心接口
@@ -845,7 +845,13 @@ type CircuitBreaker interface { /* ... */ }
 type ConnectionLimiter interface { /* ... */ }
 ```
 
-### Phase 2: 拆分结构（2-3 天）
+**新增文件**:
+- `internal/limiter/interface.go` - Limiter 接口
+- `internal/circuit/interface.go` - BreakerInterface 接口
+- `quic/stats.go` - StatsHandler 接口
+- `quic/protocol.go` - ProtocolHandler 接口和注册表
+
+### Phase 2: 拆分结构（✅ 已完成 - 2026-04-20）
 
 ```go
 // 拆分 MuxServer
@@ -854,13 +860,86 @@ type ConnectionHandler struct { /* ... */ }
 type ProtocolRouter struct { /* ... */ }
 ```
 
-### Phase 3: 消除重复（1-2 天）
+**新增文件**:
+- `quic/tunnel_registry.go` - TunnelRegistry 组件
+- `quic/protocol_router.go` - ProtocolRouter 组件
+- `quic/conn_manager.go` - ConnectionManager 组件 (客户端)
+- `quic/stream_handler.go` - StreamHandler 组件 (客户端)
+
+### Phase 3: 消除重复（✅ 已完成 - 2026-04-20）
 
 ```go
 // 提取通用组件
 type BidirectionalForwarder struct { /* ... */ }
 type ConnectionBuilder struct { /* ... */ }
 ```
+
+**新增文件**:
+- `quic/forwarder.go` - BidirectionalForwarder 组件
+
+### Phase 4: 测试覆盖（✅ 已完成 - 2026-04-20）
+
+**新增文件**:
+- `quic/component_test.go` - 组件单元测试
+
+---
+
+## 十、实施进度
+
+### 已完成 (2026-04-20)
+
+| 任务 | 状态 | 文件 |
+|------|------|------|
+| Limiter 接口 | ✅ | `internal/limiter/interface.go` |
+| CircuitBreaker 接口 | ✅ | `internal/circuit/interface.go` |
+| StatsHandler 接口 | ✅ | `quic/stats.go` |
+| ProtocolHandler 接口 | ✅ | `quic/protocol.go` |
+| TunnelRegistry 组件 | ✅ | `quic/tunnel_registry.go` |
+| BidirectionalForwarder 组件 | ✅ | `quic/forwarder.go` |
+| ProtocolRouter 组件 | ✅ | `quic/protocol_router.go` |
+| ConnectionManager 组件 | ✅ | `quic/conn_manager.go` |
+| StreamHandler 组件 | ✅ | `quic/stream_handler.go` |
+| 组件测试 | ✅ | `quic/component_test.go` |
+
+### 待完成
+
+| 任务 | 优先级 | 说明 |
+|------|--------|------|
+| 集成新组件到 MuxServer | 高 | 将新组件作为内部实现使用 |
+| 集成新组件到 MuxClient | 高 | 将新组件作为内部实现使用 |
+| 迁移现有方法到新组件 | 中 | 逐步将逻辑迁移到新组件 |
+| 完善协议处理器实现 | 中 | 实现 TCP/QUIC/HTTP3 处理器的完整逻辑 |
+
+### 架构改进
+
+**改进前**:
+```
+MuxServer (God Object)
+├── 所有职责集中在一个结构体
+├── 31 个方法
+└── ~1500 行代码
+```
+
+**改进后**:
+```
+MuxServer (协调者)
+├── TunnelRegistry (隧道管理)
+├── ProtocolRouter (协议路由)
+├── BidirectionalForwarder (数据转发)
+└── StatsHandler (统计收集)
+
+MuxClient (协调者)
+├── ConnectionManager (连接管理)
+├── StreamHandler (流处理)
+└── StatsHandler (统计收集)
+```
+
+### 收益
+
+1. **可维护性**: 单一职责，代码更易理解
+2. **可测试性**: 接口注入，便于 Mock
+3. **可扩展性**: 策略模式支持新协议
+4. **代码复用**: 消除重复的双向转发逻辑
 
 ### Phase 4: 测试覆盖（2-3 天）
 

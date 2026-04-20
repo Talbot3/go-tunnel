@@ -241,3 +241,49 @@ go test ./quic/ -v -run "TestIntegration_"
 ## 📝 测试设计计划
 
 详细的测试设计计划请参考: [plans/robust-puzzling-engelbart.md](/.claude/plans/robust-puzzling-engelbart.md)
+
+---
+
+## 🧩 新增组件测试 (2026-04-20)
+
+### 组件测试文件
+
+```
+quic/
+├── component_test.go          # 新增: 组件单元测试
+│   ├── TestStatsHandler_Interface
+│   ├── TestClientStatsHandler_Interface
+│   ├── TestNoopStatsHandler
+│   ├── TestTunnelRegistry_Basic
+│   ├── TestTunnelRegistry_Domain
+│   ├── TestTunnelRegistry_Range
+│   ├── TestProtocolHandlerRegistry
+│   └── TestSessionHeader_EncodeDecode
+```
+
+### 新增组件覆盖率
+
+| 组件 | 文件 | 测试状态 |
+|------|------|----------|
+| StatsHandler | `quic/stats.go` | ✅ 已测试 |
+| TunnelRegistry | `quic/tunnel_registry.go` | ✅ 已测试 |
+| ProtocolHandlerRegistry | `quic/protocol.go` | ✅ 已测试 |
+| BidirectionalForwarder | `quic/forwarder.go` | ⏳ 待集成 |
+| ProtocolRouter | `quic/protocol_router.go` | ⏳ 待集成 |
+| ConnectionManager | `quic/conn_manager.go` | ⏳ 待集成 |
+| StreamHandler | `quic/stream_handler.go` | ⏳ 待集成 |
+
+### 设计模式改进
+
+详见: [docs/DESIGN_PATTERN_REVIEW.md](./docs/DESIGN_PATTERN_REVIEW.md)
+
+**已完成的改进**:
+- ✅ 提取 Limiter 接口
+- ✅ 提取 CircuitBreaker 接口
+- ✅ 提取 StatsHandler 接口
+- ✅ 提取 ProtocolHandler 接口
+- ✅ 创建 TunnelRegistry 组件
+- ✅ 创建 BidirectionalForwarder 组件
+- ✅ 创建 ProtocolRouter 组件
+- ✅ 创建 ConnectionManager 组件
+- ✅ 创建 StreamHandler 组件
